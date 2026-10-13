@@ -1,139 +1,75 @@
-#include "gpu_presolver/presolve/gpu_presolve.hpp"
-#include "mps_reader/mpsreader.hpp"
-
+#include "gpu_presolver/offset.hpp"
+#include "gpu_preprocessor/gpu_preprocessor.hpp"
 #include <cuda_runtime.h>
-
-#include <chrono>
-#include <cstdint>
-#include <fstream>
+#include <cmath>
 #include <iostream>
-#include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
-
-namespace {
-using Clock = std::chrono::steady_clock;
-
-double seconds_since(Clock::time_point start) {
-  return std::chrono::duration<double>(Clock::now() - start).count();
+namespace gpp = gpu_preprocessor;
+void check(cudaError_t e) {
+  if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
-
-void check_cuda(cudaError_t status) {
-  if (status != cudaSuccess) {
-    throw std::runtime_error(cudaGetErrorString(status));
+template<class T> struct DeviceVector {
+  T* data = nullptr;
+  explicit DeviceVector(const std::vector<T>& v) {
+    if (v.empty()) return;
+    check(cudaMalloc(&data, v.size()*sizeof(T)));
+    auto e = cudaMemcpy(data,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) { cudaFree(data); data=nullptr; check(e); }
   }
-}
-
-struct CudaFree {
-  void operator()(void* pointer) const noexcept { cudaFree(pointer); }
+  ~DeviceVector() { cudaFree(data); }
+  DeviceVector(const DeviceVector&) = delete;
+  DeviceVector& operator=(const DeviceVector&) = delete;
 };
-
-// Own the input arrays until presolve (and any subsequent postsolve) finishes.
-struct DeviceMemory {
-  std::vector<std::unique_ptr<void, CudaFree>> buffers;
-
-  template <class T>
-  T* upload(const std::vector<T>& values) {
-    if (values.empty()) return nullptr;
-    T* pointer = nullptr;
-    check_cuda(cudaMalloc(&pointer, values.size() * sizeof(T)));
-    std::unique_ptr<void, CudaFree> owner(pointer);
-    check_cuda(cudaMemcpy(pointer, values.data(), values.size() * sizeof(T),
-                          cudaMemcpyHostToDevice));
-    buffers.push_back(std::move(owner));
-    return pointer;
+struct PipelineOwner {
+  gpp::Summary value;
+  ~PipelineOwner() {
+    gpp::free_summary(value);
   }
 };
-}  // namespace
-
+bool flag(const char* v) {
+  if (std::string(v)=="true" || std::string(v)=="1") return true;
+  if (std::string(v)=="false" || std::string(v)=="0") return false;
+  throw std::invalid_argument("switch value must be true/false or 1/0");
+}
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "Usage: presolve_example <model.mps>\n";
-    return 2;
-  }
-
   try {
-    std::cout << "Start reading file...." << std::endl;
-    const auto read_start = Clock::now();
-    std::ifstream input(argv[1]);
-    if (!input) throw std::runtime_error("Cannot open " + std::string(argv[1]));
-    const auto model = mps_reader::read_mps(input);
-    const auto& csr = model.lp.csr();
-    const auto& csc = model.lp.csc();
-    const double read_seconds = seconds_since(read_start);
-    std::cout << "File reading time: " << read_seconds << " seconds\n";
-    std::cout << "problem information: nRow = " << csr.rows()
-              << ", nCol = " << csr.cols() << ", nnz A = " << csr.nnz() << '\n';
-
-    // Initialize the selected CUDA device before timing input allocation/copy.
-    check_cuda(cudaSetDevice(0));
-    check_cuda(cudaDeviceSynchronize());
-    const auto copy_start = Clock::now();
-    DeviceMemory memory;
-    gpu_presolver::presolve::LPInfoGpu lp{};
-    lp.A.rows = csr.rows();
-    lp.A.cols = csr.cols();
-    lp.A.nnz = csr.nnz();
-    lp.A.rowPtr = memory.upload(std::vector<std::int32_t>(csr.row_ptr().begin(), csr.row_ptr().end()));
-    lp.A.colVal = memory.upload(std::vector<std::int32_t>(csr.col_idx().begin(), csr.col_idx().end()));
-    lp.A.nzVal = memory.upload(csr.values());
-
-    // The CSC arrays of A are the CSR arrays of its transpose.
-    lp.AT.rows = csc.cols();
-    lp.AT.cols = csc.rows();
-    lp.AT.nnz = csc.nnz();
-    lp.AT.rowPtr = memory.upload(std::vector<std::int32_t>(csc.col_ptr().begin(), csc.col_ptr().end()));
-    lp.AT.colVal = memory.upload(std::vector<std::int32_t>(csc.row_idx().begin(), csc.row_idx().end()));
-    lp.AT.nzVal = memory.upload(csc.values());
-    lp.c = memory.upload(model.lp.objective());
-    lp.AL = memory.upload(model.lp.row_lower());
-    lp.AU = memory.upload(model.lp.row_upper());
-    lp.l = memory.upload(model.lp.col_lower());
-    lp.u = memory.upload(model.lp.col_upper());
-    lp.obj_constant = model.lp.obj_constant();
-    check_cuda(cudaDeviceSynchronize());
-    const double copy_seconds = seconds_since(copy_start);
-    std::cout << "GPU-Presolver input copy time (excluded): "
-              << copy_seconds << " seconds\n";
-
-    using namespace gpu_presolver::presolve;
-    const auto wall_start = Clock::now();
-    PresolveParams params;
-    params.max_iters = 10;
-    std::cout << "GPU structure-specific rules: "
-              << (params.enable_structure_specific_rules ? "Enabled" : "Disabled")
-              << " (PresolveParams)\n";
-    std::cout << "Doing presolve (GPU-Presolver)..." << std::endl;
-    auto summary = run_gpu_presolve_with_reduced_lp(lp, params);
-    // Wall time covers parameter setup and the complete API call, ending when
-    // the reduced device LP is ready.
-    const auto sync_status = cudaDeviceSynchronize();
-    if (sync_status != cudaSuccess) {
-      free_gpu_presolve_reduced_lp(summary);
-      check_cuda(sync_status);
+    gpp::Parameters params;
+    for(int i=1;i<argc;i+=2) {
+      if(i+1>=argc) throw std::invalid_argument("missing switch value");
+      if(std::string(argv[i])=="--folding") params.enable_folding=flag(argv[i+1]);
+      else if(std::string(argv[i])=="--presolve") params.enable_presolve=flag(argv[i+1]);
+      else throw std::invalid_argument("usage: gpu_preprocessor_example [--folding true|false] [--presolve true|false]");
     }
-    const double wall_seconds = seconds_since(wall_start);
-    std::cout << "GPU-Presolver presolve wall time: "
-              << wall_seconds << " seconds\n";
-    const bool stopped = summary.has_infeasible || summary.has_unbounded;
-    std::cout << "Status: " << (summary.has_infeasible ? "infeasible" :
-                                summary.has_unbounded ? "unbounded" : "ok") << '\n';
-    if (!stopped) {
-      // Pass this device LP to your solver; this example only runs presolve.
-      const auto& reduced = summary.reduced_lp;
-      std::cout << "GPU-Presolver reduced problem: (" << lp.A.rows << ", "
-                << lp.A.cols << ") -> (" << reduced.A.rows << ", "
-                << reduced.A.cols << ")\n";
-      std::cout << "GPU-Presolver reduced nnz: " << reduced.A.nnz << '\n';
-    }
-
-    free_gpu_presolve_reduced_lp(summary);
-    // The summary releases its recovery record; memory releases the input arrays.
-    return stopped ? 1 : 0;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 2;
-  }
+    check(cudaSetDevice(0)); // Select another physical GPU with CUDA_VISIBLE_DEVICES.
+    // This example only: min x0+x1, x0>=1, x1>=1, 0<=x0,x1<=10.
+    DeviceVector<NnzOffset> rp({0,1,2});
+    DeviceVector<std::int32_t> ci({0,1});
+    DeviceVector<double> av({1,1}),c({1,1}),al({1,1}),au({INFINITY,INFINITY}),l({0,0}),u({10,10});
+    gpp::DeviceLp original;
+    original.A={2,2,2,rp.data,ci.data,av.data};
+    original.AT=original.A; // The identity is its own transpose; this example owns each allocation once.
+    original.c=c.data; original.AL=al.data; original.AU=au.data; original.l=l.data; original.u=u.data;
+    PipelineOwner pipeline;
+    pipeline.value=gpu_preprocessor::preprocess(original,params);
+    auto& p=pipeline.value.presolve;
+    if(p.has_infeasible || p.has_unbounded) throw std::runtime_error("unexpected infeasible/unbounded example");
+    std::cout<<"original 2 x 2 -> folded "<<pipeline.value.folded_rows<<" x "<<pipeline.value.folded_cols
+             <<" -> reduced "<<p.reduced_rows<<" x "<<p.reduced_cols<<"\n";
+    // Replace this analytic toy solution with your external LP solver's output.
+    // Preserve p.reduced_lp: its arrays may alias original/folded allocations.
+    if(p.reduced_rows!=p.reduced_cols || p.reduced_cols>2)
+      throw std::runtime_error("unexpected toy reduction; update the analytic example");
+    DeviceVector<double> xr(std::vector<double>(p.reduced_cols,1.0));
+    DeviceVector<double> yr(std::vector<double>(p.reduced_rows,p.reduced_cols==1?2.0:1.0));
+    DeviceVector<double> zr(std::vector<double>(p.reduced_cols,0.0));
+    const auto sol=gpu_preprocessor::postprocess(xr.data,yr.data,zr.data,pipeline.value,original);
+    if(sol.x.size()!=2 || std::abs(sol.x[0]-1)>1e-8 || std::abs(sol.x[1]-1)>1e-8)
+      throw std::runtime_error("original primal recovery failed");
+    std::cout<<"original primal: "<<sol.x[0]<<", "<<sol.x[1]<<"; objective: "<<sol.x[0]+sol.x[1]<<"\n";
+    std::cout<<"This checks primal recovery for a toy LP; validate original KKT in your solver integration.\n";
+    return 0;
+  } catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
 }

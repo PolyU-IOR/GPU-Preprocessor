@@ -1,4 +1,4 @@
-#include "test_cuda_helpers.hpp"
+#include "gpu_presolver/offset.hpp"
 #include "gpu_presolver/presolve/rules/rule_dual_fix.hpp"
 
 #include <cuda_runtime.h>
@@ -14,9 +14,28 @@
 
 namespace {
 
-using gpu_presolver_test::check;
-using gpu_presolver_test::copy_to_device;
-using gpu_presolver_test::copy_to_host;
+void check(cudaError_t status, const char* context) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
+  }
+}
+
+template <class T>
+T* copy_to_device(const std::vector<T>& values) {
+  T* device = nullptr;
+  check(cudaMalloc(&device, sizeof(T) * values.size()), "cudaMalloc");
+  check(cudaMemcpy(device, values.data(), sizeof(T) * values.size(), cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D");
+  return device;
+}
+
+template <class T>
+std::vector<T> copy_to_host(T* device, std::size_t size) {
+  std::vector<T> values(size);
+  check(cudaMemcpy(values.data(), device, sizeof(T) * size, cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H");
+  return values;
+}
 
 }  // namespace
 
@@ -32,7 +51,7 @@ void test_fixes_improving_unlocked_column() {
   lp.A.rows = 1;
   lp.A.cols = 1;
   lp.AT = {1, 1, 1,
-           copy_to_device<std::int32_t>({0, 1}),
+           copy_to_device<NnzOffset>({0, 1}),
            copy_to_device<std::int32_t>({0}),
            copy_to_device<double>({1.0})};
 
@@ -86,7 +105,7 @@ void test_marks_unbounded_improving_column() {
   lp.A.rows = 0;
   lp.A.cols = 1;
   lp.AT = {1, 0, 0,
-           copy_to_device<std::int32_t>({0, 0}),
+           copy_to_device<NnzOffset>({0, 0}),
            nullptr,
            nullptr};
   PresolvePlanGpu plan;
@@ -121,7 +140,7 @@ void test_degree_guard_keeps_dense_nonzero_cost_column() {
   lp.A.rows = 1;
   lp.A.cols = 1;
   lp.AT = {1, 1, 1,
-           copy_to_device<std::int32_t>({0, 1}),
+           copy_to_device<NnzOffset>({0, 1}),
            copy_to_device<std::int32_t>({0}),
            copy_to_device<double>({1.0})};
 
@@ -167,11 +186,11 @@ void test_records_infinite_zero_objective_fix() {
 
   LPInfoGpu lp;
   lp.A = {1, 1, 1,
-          copy_to_device<std::int32_t>({0, 1}),
+          copy_to_device<NnzOffset>({0, 1}),
           copy_to_device<std::int32_t>({0}),
           copy_to_device<double>({1.0})};
   lp.AT = {1, 1, 1,
-           copy_to_device<std::int32_t>({0, 1}),
+           copy_to_device<NnzOffset>({0, 1}),
            copy_to_device<std::int32_t>({0}),
            copy_to_device<double>({1.0})};
 
@@ -196,8 +215,8 @@ void test_records_infinite_zero_objective_fix() {
   assert(plan.has_change);
   assert((plan.tape.types == std::vector<std::int32_t>{
                                  static_cast<std::int32_t>(PostsolveReductionType::FixedColInf)}));
-  assert((plan.tape.index_starts == std::vector<std::int32_t>{0, 4}));
-  assert((plan.tape.value_starts == std::vector<std::int32_t>{0, 4}));
+  assert((plan.tape.index_starts == std::vector<NnzOffset>{0, 4}));
+  assert((plan.tape.value_starts == std::vector<NnzOffset>{0, 4}));
   assert((plan.tape.dual_modes == std::vector<std::uint8_t>{
                                       static_cast<std::uint8_t>(PostsolveDualMode::Exact)}));
   assert((plan.tape.indices == std::vector<std::int32_t>{-1, 0, 1, 0}));

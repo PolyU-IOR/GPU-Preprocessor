@@ -1,10 +1,11 @@
-#include "mps_reader/sparse_matrix.hpp"
+#include <cstdint>
+#include "cpu_presolve/sparse_matrix.hpp"
 
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-namespace mps_reader {
+namespace cpu_presolve {
 namespace {
 
 void validate_shape(int rows, int cols) {
@@ -20,7 +21,7 @@ void validate_compressed_matrix(const char* pointer_name,
                                 const char* index_name,
                                 int major_size,
                                 int minor_size,
-                                const std::vector<int>& pointer,
+                                const std::vector<std::int64_t>& pointer,
                                 const std::vector<int>& index,
                                 const std::vector<double>& values) {
   if (pointer.size() != static_cast<std::size_t>(major_size + 1)) {
@@ -37,7 +38,7 @@ void validate_compressed_matrix(const char* pointer_name,
       throw std::invalid_argument(std::string(pointer_name) + " must be monotone non-decreasing");
     }
   }
-  if (pointer.back() != static_cast<int>(values.size())) {
+  if (pointer.back() != static_cast<std::int64_t>(values.size())) {
     throw std::invalid_argument(std::string(pointer_name) + " final entry must equal nnz");
   }
   for (int idx : index) {
@@ -51,7 +52,7 @@ void validate_compressed_matrix(const char* pointer_name,
 
 CsrMatrix::CsrMatrix(int rows,
                      int cols,
-                     std::vector<int> row_ptr,
+                     std::vector<std::int64_t> row_ptr,
                      std::vector<int> col_idx,
                      std::vector<double> values)
     : rows_(rows),
@@ -69,19 +70,19 @@ CscMatrix CsrMatrix::to_csc() const {
     ++col_counts[col];
   }
 
-  std::vector<int> col_ptr(cols_ + 1, 0);
+  std::vector<std::int64_t> col_ptr(cols_ + 1, 0);
   for (int col = 0; col < cols_; ++col) {
     col_ptr[col + 1] = col_ptr[col] + col_counts[col];
   }
 
-  std::vector<int> next = col_ptr;
+  std::vector<std::int64_t> next = col_ptr;
   std::vector<int> row_idx(values_.size(), 0);
   std::vector<double> csc_values(values_.size(), 0.0);
 
   for (int row = 0; row < rows_; ++row) {
-    for (int pos = row_ptr_[row]; pos < row_ptr_[row + 1]; ++pos) {
+    for (std::int64_t pos = row_ptr_[row]; pos < row_ptr_[row + 1]; ++pos) {
       const int col = col_idx_[pos];
-      const int dest = next[col]++;
+      const std::int64_t dest = next[col]++;
       row_idx[dest] = row;
       csc_values[dest] = values_[pos];
     }
@@ -92,7 +93,7 @@ CscMatrix CsrMatrix::to_csc() const {
 
 CscMatrix::CscMatrix(int rows,
                      int cols,
-                     std::vector<int> col_ptr,
+                     std::vector<std::int64_t> col_ptr,
                      std::vector<int> row_idx,
                      std::vector<double> values)
     : rows_(rows),
@@ -110,19 +111,19 @@ CsrMatrix CscMatrix::to_csr() const {
     ++row_counts[row];
   }
 
-  std::vector<int> row_ptr(rows_ + 1, 0);
+  std::vector<std::int64_t> row_ptr(rows_ + 1, 0);
   for (int row = 0; row < rows_; ++row) {
     row_ptr[row + 1] = row_ptr[row] + row_counts[row];
   }
 
-  std::vector<int> next = row_ptr;
+  std::vector<std::int64_t> next = row_ptr;
   std::vector<int> col_idx(values_.size(), 0);
   std::vector<double> csr_values(values_.size(), 0.0);
 
   for (int col = 0; col < cols_; ++col) {
-    for (int pos = col_ptr_[col]; pos < col_ptr_[col + 1]; ++pos) {
+    for (std::int64_t pos = col_ptr_[col]; pos < col_ptr_[col + 1]; ++pos) {
       const int row = row_idx_[pos];
-      const int dest = next[row]++;
+      const std::int64_t dest = next[row]++;
       col_idx[dest] = col;
       csr_values[dest] = values_[pos];
     }
@@ -131,4 +132,4 @@ CsrMatrix CscMatrix::to_csr() const {
   return CsrMatrix(rows_, cols_, std::move(row_ptr), std::move(col_idx), std::move(csr_values));
 }
 
-}  // namespace mps_reader
+}  // namespace cpu_presolve

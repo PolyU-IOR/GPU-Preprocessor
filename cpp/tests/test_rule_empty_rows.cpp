@@ -1,5 +1,4 @@
-#include "test_cuda_helpers.hpp"
-#include "gpu_presolver/presolve/rules/rule_empty_rows.hpp"
+#include "gpu_presolver/presolve/rules/rule_empty_rows_and_columns.hpp"
 
 #include <cuda_runtime.h>
 
@@ -12,9 +11,28 @@
 
 namespace {
 
-using gpu_presolver_test::check;
-using gpu_presolver_test::copy_to_device;
-using gpu_presolver_test::copy_to_host;
+void check(cudaError_t status, const char* context) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
+  }
+}
+
+template <class T>
+T* copy_to_device(const std::vector<T>& values) {
+  T* device = nullptr;
+  check(cudaMalloc(&device, sizeof(T) * values.size()), "cudaMalloc");
+  check(cudaMemcpy(device, values.data(), sizeof(T) * values.size(), cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D");
+  return device;
+}
+
+template <class T>
+std::vector<T> copy_to_host(T* device, std::size_t size) {
+  std::vector<T> values(size);
+  check(cudaMemcpy(values.data(), device, sizeof(T) * size, cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H");
+  return values;
+}
 
 }  // namespace
 

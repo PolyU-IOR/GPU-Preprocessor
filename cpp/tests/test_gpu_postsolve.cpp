@@ -1,4 +1,5 @@
-#include "test_cuda_helpers.hpp"
+#include "gpu_presolver/offset.hpp"
+#include "gpu_presolver/presolve/device_recovery.hpp"
 #include "gpu_presolver/presolve/gpu_postsolve.hpp"
 #include "gpu_presolver/presolve/gpu_presolve.hpp"
 
@@ -12,14 +13,31 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <type_traits>
-#include <utility>
 
 namespace {
 
-using gpu_presolver_test::check;
-using gpu_presolver_test::copy_to_device;
-using gpu_presolver_test::copy_to_host;
+void check(cudaError_t status, const char* context) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
+  }
+}
+
+template <class T>
+T* copy_to_device(const std::vector<T>& values) {
+  T* device = nullptr;
+  check(cudaMalloc(&device, sizeof(T) * values.size()), "cudaMalloc");
+  check(cudaMemcpy(device, values.data(), sizeof(T) * values.size(), cudaMemcpyHostToDevice),
+        "cudaMemcpy H2D");
+  return device;
+}
+
+template <class T>
+std::vector<T> copy_to_host(T* device, std::size_t size) {
+  std::vector<T> values(size);
+  check(cudaMemcpy(values.data(), device, sizeof(T) * size, cudaMemcpyDeviceToHost),
+        "cudaMemcpy D2H");
+  return values;
+}
 
 void test_postsolve_scatter_and_fixed_column_restore() {
   using gpu_presolver::presolve::GpuPostsolveResult;
@@ -106,7 +124,7 @@ void test_postsolve_keeps_unretrieved_fixed_column_dual_tape_based_with_original
 
   LPInfoGpu original;
   original.AT = {2, 1, 1,
-                 copy_to_device<std::int32_t>({0, 1, 1}),
+                 copy_to_device<NnzOffset>({0, 1, 1}),
                  copy_to_device<std::int32_t>({0}),
                  copy_to_device<double>({2.0})};
   original.c = copy_to_device<double>({10.0, 5.0});
@@ -144,11 +162,11 @@ void test_presolve_record_drives_fixed_column_postsolve() {
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu lp;
   lp.A = {1, 2, 2,
-          copy_to_device<std::int32_t>({0, 2}),
+          copy_to_device<NnzOffset>({0, 2}),
           copy_to_device<std::int32_t>({0, 1}),
           copy_to_device<double>({2.0, 3.0})};
   lp.AT = {2, 1, 2,
-           copy_to_device<std::int32_t>({0, 1, 2}),
+           copy_to_device<NnzOffset>({0, 1, 2}),
            copy_to_device<std::int32_t>({0, 0}),
            copy_to_device<double>({2.0, 3.0})};
   lp.c = copy_to_device<double>({1.0, 2.0});
@@ -161,19 +179,20 @@ void test_presolve_record_drives_fixed_column_postsolve() {
   params.max_iters = 1;
   params.enable_empty_rows = false;
   params.enable_singleton_rows = false;
-  params.enable_infeasible_redundant_rows = false;
-  params.enable_implied_variable_bounds = false;
-  params.enable_duplicate_rows = false;
-  params.enable_empty_cols = false;
-  params.enable_column_singletons_dual_infer = false;
-  params.enable_column_singletons_eq = false;
+  params.enable_infeasible_and_redundant_rows = false;
+  params.enable_bound_strengthening = false;
+  params.enable_parallel_rows = false;
+  params.enable_empty_columns = false;
+
+  params.enable_singleton_columns = false;
   params.enable_doubleton_equations = false;
   params.enable_dual_fix = false;
-  params.enable_duplicate_columns = false;
-  params.enable_structural_l1_substitution = false;
-  params.enable_tiered_bootstrap = false;
+  params.enable_parallel_columns = false;
+  params.enable_absolute_value_epigraph_reduction = false;
+  params.enable_startup = false;
 
   GpuPresolveSummary summary = gpu_presolver::presolve::run_gpu_presolve_with_record(lp, params);
+  gpu_presolver::presolve::export_recovery_record(summary.record);
   assert(summary.reduced_rows == 1);
   assert(summary.reduced_cols == 1);
   assert(summary.record.m0 == 1);
@@ -215,24 +234,24 @@ void test_presolve_record_drives_fixed_column_postsolve() {
   cudaFree(lp.AU);
 }
 
-void test_infeasible_fixed_variables_near_fixed_value_is_recorded_for_postsolve() {
+void test_infeasible_and_fixed_variables_postsolve(double width, bool expect_fixed) {
   using gpu_presolver::presolve::GpuPostsolveResult;
   using gpu_presolver::presolve::GpuPresolveSummary;
   using gpu_presolver::presolve::LPInfoGpu;
   using gpu_presolver::presolve::PresolveParams;
 
   constexpr double lower = 2.0;
-  constexpr double upper = 2.0 + 5.0e-7;
-  constexpr double midpoint = lower + 0.5 * (upper - lower);
+  const double upper = lower + width;
+  const double midpoint = lower + 0.5 * (upper - lower);
   const double inf = std::numeric_limits<double>::infinity();
 
   LPInfoGpu lp;
   lp.A = {1, 2, 2,
-          copy_to_device<std::int32_t>({0, 2}),
+          copy_to_device<NnzOffset>({0, 2}),
           copy_to_device<std::int32_t>({0, 1}),
           copy_to_device<double>({1.0, 1.0})};
   lp.AT = {2, 1, 2,
-           copy_to_device<std::int32_t>({0, 1, 2}),
+           copy_to_device<NnzOffset>({0, 1, 2}),
            copy_to_device<std::int32_t>({0, 0}),
            copy_to_device<double>({1.0, 1.0})};
   lp.c = copy_to_device<double>({1.0, 0.0});
@@ -244,37 +263,47 @@ void test_infeasible_fixed_variables_near_fixed_value_is_recorded_for_postsolve(
   PresolveParams params;
   params.max_iters = 1;
   params.record_postsolve_tape_cpu = false;
-  params.enable_tiered_bootstrap = false;
+  params.enable_startup = false;
   params.enable_empty_rows = false;
   params.enable_singleton_rows = false;
-  params.enable_infeasible_redundant_rows = false;
-  params.enable_implied_variable_bounds = false;
-  params.enable_duplicate_rows = false;
-  params.enable_empty_cols = false;
-  params.enable_column_singletons_dual_infer = false;
-  params.enable_column_singletons_eq = false;
+  params.enable_infeasible_and_redundant_rows = false;
+  params.enable_bound_strengthening = false;
+  params.enable_parallel_rows = false;
+  params.enable_empty_columns = false;
+
+  params.enable_singleton_columns = false;
   params.enable_doubleton_equations = false;
   params.enable_dual_fix = false;
-  params.enable_duplicate_columns = false;
-  params.enable_structural_l1_substitution = false;
-  params.enable_antipodal_components = false;
-  params.enable_covering_cost_dominance = false;
+  params.enable_parallel_columns = false;
+  params.enable_absolute_value_epigraph_reduction = false;
+  params.enable_variable_pair_aggregation = false;
+  params.enable_column_domination = false;
 
   assert(params.bound_tol == 1.0e-6);
   assert(!params.record_postsolve_tape_cpu);
   GpuPresolveSummary summary = gpu_presolver::presolve::run_gpu_presolve_with_record(lp, params);
+  gpu_presolver::presolve::export_recovery_record(summary.record);
   assert(summary.reduced_rows == 1);
-  assert(summary.reduced_cols == 1);
-  assert((summary.record.col_red2org == std::vector<std::int32_t>{1}));
-  assert((summary.record.fixed_idx == std::vector<std::int32_t>{0}));
-  assert(summary.record.fixed_val.size() == 1);
-  assert(std::fabs(summary.record.fixed_val[0] - midpoint) < 1.0e-12);
+  if (expect_fixed) {
+    assert(summary.reduced_cols == 1);
+    assert((summary.record.col_red2org == std::vector<std::int32_t>{1}));
+    assert((summary.record.fixed_idx == std::vector<std::int32_t>{0}));
+    assert(summary.record.fixed_val == std::vector<double>{midpoint});
+  } else {
+    assert(summary.reduced_cols == 2);
+    assert((summary.record.col_red2org == std::vector<std::int32_t>{0, 1}));
+    assert(summary.record.fixed_idx.empty());
+    assert(summary.record.fixed_val.empty());
+  }
 
-  double* x_red = copy_to_device<double>({4.0});
+  double* x_red = copy_to_device(expect_fixed ? std::vector<double>{4.0}
+                                              : std::vector<double>{lower, 4.0});
   GpuPostsolveResult result =
       gpu_presolver::presolve::postsolve_gpu(x_red, nullptr, nullptr, summary.record);
   const std::vector<double> x = copy_to_host(result.x_org, 2);
-  assert(std::fabs(x[0] - midpoint) < 1.0e-12);
+  // Recover accepted midpoints exactly; preserve the solver's endpoint when
+  // the approximate fixing was rejected by the row-error guard.
+  assert(std::fabs(x[0] - (expect_fixed ? midpoint : lower)) < 1.0e-12);
   assert(x[0] >= lower && x[0] <= upper);
   assert(std::fabs(x[1] - 4.0) < 1.0e-12);
 
@@ -303,11 +332,11 @@ void test_empty_column_fixed_value_is_recorded_for_postsolve() {
 
   LPInfoGpu lp;
   lp.A = {0, 1, 0,
-          copy_to_device<std::int32_t>({0}),
+          copy_to_device<NnzOffset>({0}),
           nullptr,
           nullptr};
   lp.AT = {1, 0, 0,
-           copy_to_device<std::int32_t>({0, 0}),
+           copy_to_device<NnzOffset>({0, 0}),
            nullptr,
            nullptr};
   lp.c = copy_to_device<double>({2.0});
@@ -318,21 +347,22 @@ void test_empty_column_fixed_value_is_recorded_for_postsolve() {
 
   PresolveParams params;
   params.max_iters = 1;
-  params.enable_tiered_bootstrap = false;
-  params.enable_infeasible_fixed_variables = false;
+  params.enable_startup = false;
+  params.enable_infeasible_and_fixed_variables = false;
   params.enable_empty_rows = false;
   params.enable_singleton_rows = false;
-  params.enable_infeasible_redundant_rows = false;
-  params.enable_implied_variable_bounds = false;
-  params.enable_duplicate_rows = false;
-  params.enable_column_singletons_dual_infer = false;
-  params.enable_column_singletons_eq = false;
+  params.enable_infeasible_and_redundant_rows = false;
+  params.enable_bound_strengthening = false;
+  params.enable_parallel_rows = false;
+
+  params.enable_singleton_columns = false;
   params.enable_doubleton_equations = false;
   params.enable_dual_fix = false;
-  params.enable_duplicate_columns = false;
-  params.enable_structural_l1_substitution = false;
+  params.enable_parallel_columns = false;
+  params.enable_absolute_value_epigraph_reduction = false;
 
   GpuPresolveSummary summary = gpu_presolver::presolve::run_gpu_presolve_with_record(lp, params);
+  gpu_presolver::presolve::export_recovery_record(summary.record);
   assert(summary.reduced_rows == 0);
   assert(summary.reduced_cols == 0);
   assert((summary.record.fixed_idx == std::vector<std::int32_t>{0}));
@@ -351,7 +381,7 @@ void test_empty_column_fixed_value_is_recorded_for_postsolve() {
   cudaFree(lp.u);
 }
 
-void test_duplicate_columnumn_tape_replay_restores_primal_and_dual() {
+void test_parallel_columnumn_tape_replay_restores_primal_and_dual() {
   using gpu_presolver::presolve::GpuPostsolveResult;
   using gpu_presolver::presolve::PostsolveDualMode;
   using gpu_presolver::presolve::PostsolveReductionType;
@@ -364,7 +394,7 @@ void test_duplicate_columnumn_tape_replay_restores_primal_and_dual() {
   record.n1 = 1;
   record.col_red2org = {0};
   record.col_org2red = {0, -1};
-  record.tape.types = {static_cast<std::int32_t>(PostsolveReductionType::DuplicateColumn)};
+  record.tape.types = {static_cast<std::int32_t>(PostsolveReductionType::ParallelColumn)};
   record.tape.index_starts = {0, 2};
   record.tape.value_starts = {0, 5};
   record.tape.dual_modes = {static_cast<std::uint8_t>(PostsolveDualMode::Minimal)};
@@ -436,11 +466,11 @@ void test_doubleton_equations_original_model_replay_splits_induced_bound_dual() 
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu original;
   original.A = {2, 2, 3,
-                copy_to_device<std::int32_t>({0, 2, 3}),
+                copy_to_device<NnzOffset>({0, 2, 3}),
                 copy_to_device<std::int32_t>({0, 1, 0}),
                 copy_to_device<double>({2.0, -2.0, 3.0})};
   original.AT = {2, 2, 3,
-                 copy_to_device<std::int32_t>({0, 2, 3}),
+                 copy_to_device<NnzOffset>({0, 2, 3}),
                  copy_to_device<std::int32_t>({0, 1, 0}),
                  copy_to_device<double>({2.0, 3.0, -2.0})};
   original.c = copy_to_device<double>({10.0, 0.0});
@@ -613,7 +643,7 @@ void test_fme_and_eq_to_ineq_tape_replay() {
   cudaFree(result.z_org);
 }
 
-void test_duplicate_row_original_model_replay_splits_dual_between_rows() {
+void test_parallel_row_original_model_replay_splits_dual_between_rows() {
   using gpu_presolver::presolve::GpuPostsolveResult;
   using gpu_presolver::presolve::LPInfoGpu;
   using gpu_presolver::presolve::PostsolveDualMode;
@@ -623,11 +653,11 @@ void test_duplicate_row_original_model_replay_splits_dual_between_rows() {
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu original;
   original.A = {2, 1, 2,
-                copy_to_device<std::int32_t>({0, 1, 2}),
+                copy_to_device<NnzOffset>({0, 1, 2}),
                 copy_to_device<std::int32_t>({0, 0}),
                 copy_to_device<double>({1.0, 1.0})};
   original.AT = {1, 2, 2,
-                 copy_to_device<std::int32_t>({0, 2}),
+                 copy_to_device<NnzOffset>({0, 2}),
                  copy_to_device<std::int32_t>({0, 1}),
                  copy_to_device<double>({1.0, 1.0})};
   original.c = copy_to_device<double>({0.0});
@@ -643,7 +673,7 @@ void test_duplicate_row_original_model_replay_splits_dual_between_rows() {
   record.n1 = 1;
   record.row_red2org = {0};
   record.col_red2org = {0};
-  record.tape.types = {static_cast<std::int32_t>(PostsolveReductionType::DuplicateRow)};
+  record.tape.types = {static_cast<std::int32_t>(PostsolveReductionType::ParallelRow)};
   record.tape.index_starts = {0, 2};
   record.tape.value_starts = {0, 5};
   record.tape.dual_modes = {static_cast<std::uint8_t>(PostsolveDualMode::Minimal)};
@@ -686,11 +716,11 @@ void test_deleted_row_and_bound_change_replay_with_original_model() {
 
   LPInfoGpu original;
   original.A = {1, 1, 1,
-                copy_to_device<std::int32_t>({0, 1}),
+                copy_to_device<NnzOffset>({0, 1}),
                 copy_to_device<std::int32_t>({0}),
                 copy_to_device<double>({2.0})};
   original.AT = {1, 1, 1,
-                 copy_to_device<std::int32_t>({0, 1}),
+                 copy_to_device<NnzOffset>({0, 1}),
                  copy_to_device<std::int32_t>({0}),
                  copy_to_device<double>({2.0})};
   original.c = copy_to_device<double>({6.0});
@@ -748,11 +778,11 @@ void test_row_bound_change_replay_refines_live_row_duals_from_original_model() {
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu original;
   original.A = {1, 1, 1,
-                copy_to_device<std::int32_t>({0, 1}),
+                copy_to_device<NnzOffset>({0, 1}),
                 copy_to_device<std::int32_t>({0}),
                 copy_to_device<double>({2.0})};
   original.AT = {1, 1, 1,
-                 copy_to_device<std::int32_t>({0, 1}),
+                 copy_to_device<NnzOffset>({0, 1}),
                  copy_to_device<std::int32_t>({0}),
                  copy_to_device<double>({2.0})};
   original.c = copy_to_device<double>({6.0});
@@ -813,11 +843,11 @@ void test_bound_change_no_row_replay_projects_unprotected_column_dual() {
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu original;
   original.A = {1, 1, 1,
-                copy_to_device<std::int32_t>({0, 1}),
+                copy_to_device<NnzOffset>({0, 1}),
                 copy_to_device<std::int32_t>({0}),
                 copy_to_device<double>({2.0})};
   original.AT = {1, 1, 1,
-                 copy_to_device<std::int32_t>({0, 1}),
+                 copy_to_device<NnzOffset>({0, 1}),
                  copy_to_device<std::int32_t>({0}),
                  copy_to_device<double>({2.0})};
   original.c = copy_to_device<double>({5.0});
@@ -865,7 +895,7 @@ void test_bound_change_no_row_replay_projects_unprotected_column_dual() {
   cudaFree(original.AU);
 }
 
-void test_dual_tape_replay_runs_after_structural_primal_recovery() {
+void test_dual_tape_replay_runs_after_absolute_value_epigraph_recovery() {
   using gpu_presolver::presolve::GpuPostsolveResult;
   using gpu_presolver::presolve::LPInfoGpu;
   using gpu_presolver::presolve::PostsolveDualMode;
@@ -873,17 +903,17 @@ void test_dual_tape_replay_runs_after_structural_primal_recovery() {
   using gpu_presolver::presolve::PrimalRecoveryCheckpoint;
   using gpu_presolver::presolve::PrimalRecoveryKind;
   using gpu_presolver::presolve::PresolveRecordGpu;
-  using gpu_presolver::presolve::StructuralL1PrimalRecoveryStep;
-  using gpu_presolver::presolve::StructuralL1SplitRecovery;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphPrimalRecoveryStep;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphSplitRecovery;
 
   const double inf = std::numeric_limits<double>::infinity();
   LPInfoGpu original;
   original.A = {1, 2, 2,
-                copy_to_device<std::int32_t>({0, 2}),
+                copy_to_device<NnzOffset>({0, 2}),
                 copy_to_device<std::int32_t>({0, 1}),
                 copy_to_device<double>({1.0, 1.0})};
   original.AT = {2, 1, 2,
-                 copy_to_device<std::int32_t>({0, 1, 2}),
+                 copy_to_device<NnzOffset>({0, 1, 2}),
                  copy_to_device<std::int32_t>({0, 0}),
                  copy_to_device<double>({1.0, 1.0})};
   original.c = copy_to_device<double>({5.0, 0.0});
@@ -905,12 +935,12 @@ void test_dual_tape_replay_runs_after_structural_primal_recovery() {
   record.tape.dual_modes = {static_cast<std::uint8_t>(PostsolveDualMode::Minimal)};
   record.tape.indices = {0};
 
-  StructuralL1PrimalRecoveryStep step;
+  AbsoluteValueEpigraphPrimalRecoveryStep step;
   step.pattern = "test_split";
-  step.splits.push_back(StructuralL1SplitRecovery{0, 1, 1.0});
-  record.structural_primal_recoveries.push_back(step);
+  step.splits.push_back(AbsoluteValueEpigraphSplitRecovery{0, 1, 1.0});
+  record.absolute_value_epigraph_recoveries.push_back(step);
   record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-      PrimalRecoveryKind::StructuralL1, 0, 0});
+      PrimalRecoveryKind::AbsoluteValueEpigraph, 0, 0});
 
   double* x_red = copy_to_device<double>({3.0, 1.0});
   double* y_red = copy_to_device<double>({0.0});
@@ -948,8 +978,8 @@ void test_tape_checkpoint_replays_after_structural_primal() {
   using gpu_presolver::presolve::PrimalRecoveryCheckpoint;
   using gpu_presolver::presolve::PrimalRecoveryKind;
   using gpu_presolver::presolve::PresolveRecordGpu;
-  using gpu_presolver::presolve::StructuralL1PrimalRecoveryStep;
-  using gpu_presolver::presolve::StructuralL1SplitRecovery;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphPrimalRecoveryStep;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphSplitRecovery;
 
   PresolveRecordGpu record;
   record.m0 = 0;
@@ -968,12 +998,12 @@ void test_tape_checkpoint_replays_after_structural_primal() {
   // One lower affine side: z >= x_0.
   record.tape.vals = {1.0, 1.0, 1.0, 0.0, 1.0};
 
-  StructuralL1PrimalRecoveryStep step;
+  AbsoluteValueEpigraphPrimalRecoveryStep step;
   step.pattern = "test_tape_checkpoint_order";
-  step.splits.push_back(StructuralL1SplitRecovery{0, 1, 1.0});
-  record.structural_primal_recoveries.push_back(step);
+  step.splits.push_back(AbsoluteValueEpigraphSplitRecovery{0, 1, 1.0});
+  record.absolute_value_epigraph_recoveries.push_back(step);
   record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-      PrimalRecoveryKind::StructuralL1, 0, 1});
+      PrimalRecoveryKind::AbsoluteValueEpigraph, 0, 1});
 
   double* x_red = copy_to_device<double>({3.0, 1.0});
   double* z_red = copy_to_device<double>({0.0, 0.0});
@@ -998,8 +1028,8 @@ void test_structural_tape_structural_timeline_replays_exact_reverse_order() {
   using gpu_presolver::presolve::PrimalRecoveryCheckpoint;
   using gpu_presolver::presolve::PrimalRecoveryKind;
   using gpu_presolver::presolve::PresolveRecordGpu;
-  using gpu_presolver::presolve::StructuralL1PrimalRecoveryStep;
-  using gpu_presolver::presolve::StructuralL1SplitRecovery;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphPrimalRecoveryStep;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphSplitRecovery;
 
   PresolveRecordGpu record;
   record.m0 = 0;
@@ -1017,19 +1047,19 @@ void test_structural_tape_structural_timeline_replays_exact_reverse_order() {
   record.tape.indices = {0, 2, 1, 0};
   record.tape.vals = {1.0, 1.0, 1.0, 0.0, 1.0};
 
-  StructuralL1PrimalRecoveryStep first;
+  AbsoluteValueEpigraphPrimalRecoveryStep first;
   first.pattern = "timeline_s1";
-  first.splits.push_back(StructuralL1SplitRecovery{0, 1, 1.0});
-  record.structural_primal_recoveries.push_back(first);
+  first.splits.push_back(AbsoluteValueEpigraphSplitRecovery{0, 1, 1.0});
+  record.absolute_value_epigraph_recoveries.push_back(first);
   record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-      PrimalRecoveryKind::StructuralL1, 0, 0});
+      PrimalRecoveryKind::AbsoluteValueEpigraph, 0, 0});
 
-  StructuralL1PrimalRecoveryStep second;
+  AbsoluteValueEpigraphPrimalRecoveryStep second;
   second.pattern = "timeline_s2";
-  second.splits.push_back(StructuralL1SplitRecovery{0, 3, 1.0});
-  record.structural_primal_recoveries.push_back(second);
+  second.splits.push_back(AbsoluteValueEpigraphSplitRecovery{0, 3, 1.0});
+  record.absolute_value_epigraph_recoveries.push_back(second);
   record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-      PrimalRecoveryKind::StructuralL1, 1, 1});
+      PrimalRecoveryKind::AbsoluteValueEpigraph, 1, 1});
 
   double* x_red = copy_to_device<double>({2.0, 1.0, 1.0});
   double* z_red = copy_to_device<double>({0.0, 0.0, 0.0});
@@ -1049,16 +1079,16 @@ void test_postsolve_rejects_invalid_primal_recovery_checkpoint() {
   using gpu_presolver::presolve::PrimalRecoveryCheckpoint;
   using gpu_presolver::presolve::PrimalRecoveryKind;
   using gpu_presolver::presolve::PresolveRecordGpu;
-  using gpu_presolver::presolve::StructuralL1PrimalRecoveryStep;
-  using gpu_presolver::presolve::StructuralL1SplitRecovery;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphPrimalRecoveryStep;
+  using gpu_presolver::presolve::AbsoluteValueEpigraphSplitRecovery;
 
   PresolveRecordGpu record;
   record.n0 = 2;
-  StructuralL1PrimalRecoveryStep step;
-  step.splits.push_back(StructuralL1SplitRecovery{0, 1, 1.0});
-  record.structural_primal_recoveries.push_back(step);
+  AbsoluteValueEpigraphPrimalRecoveryStep step;
+  step.splits.push_back(AbsoluteValueEpigraphSplitRecovery{0, 1, 1.0});
+  record.absolute_value_epigraph_recoveries.push_back(step);
   record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-      PrimalRecoveryKind::StructuralL1, 0, 1});
+      PrimalRecoveryKind::AbsoluteValueEpigraph, 0, 1});
 
   bool threw = false;
   try {
@@ -1070,7 +1100,7 @@ void test_postsolve_rejects_invalid_primal_recovery_checkpoint() {
   assert(threw);
 }
 
-void test_duplicate_columnumn_rule_records_globalized_postsolve_tape() {
+void test_parallel_columnumn_rule_records_globalized_postsolve_tape() {
   using gpu_presolver::presolve::GpuPostsolveResult;
   using gpu_presolver::presolve::GpuPresolveSummary;
   using gpu_presolver::presolve::LPInfoGpu;
@@ -1079,11 +1109,11 @@ void test_duplicate_columnumn_rule_records_globalized_postsolve_tape() {
 
   LPInfoGpu lp;
   lp.A = {2, 2, 4,
-          copy_to_device<std::int32_t>({0, 2, 4}),
+          copy_to_device<NnzOffset>({0, 2, 4}),
           copy_to_device<std::int32_t>({0, 1, 0, 1}),
           copy_to_device<double>({1.0, 2.0, 2.0, 4.0})};
   lp.AT = {2, 2, 4,
-           copy_to_device<std::int32_t>({0, 2, 4}),
+           copy_to_device<NnzOffset>({0, 2, 4}),
            copy_to_device<std::int32_t>({0, 1, 0, 1}),
            copy_to_device<double>({1.0, 2.0, 2.0, 4.0})};
   lp.c = copy_to_device<double>({1.0, 2.0});
@@ -1093,34 +1123,36 @@ void test_duplicate_columnumn_rule_records_globalized_postsolve_tape() {
   lp.AU = copy_to_device<double>({10.0, 10.0});
 
   PresolveParams params;
-  params.max_iters = 2;
-  params.enable_tiered_bootstrap = false;
-  params.enable_infeasible_fixed_variables = false;
+  // Propagation, Aggregate, then Parallel Detection.
+  params.max_iters = 3;
+  params.enable_startup = false;
+  params.enable_infeasible_and_fixed_variables = false;
   params.enable_empty_rows = false;
   params.enable_singleton_rows = false;
-  params.enable_infeasible_redundant_rows = false;
-  params.enable_implied_variable_bounds = false;
-  params.enable_duplicate_rows = false;
-  params.enable_empty_cols = false;
-  params.enable_column_singletons_dual_infer = false;
-  params.enable_column_singletons_eq = false;
+  params.enable_infeasible_and_redundant_rows = false;
+  params.enable_bound_strengthening = false;
+  params.enable_parallel_rows = false;
+  params.enable_empty_columns = false;
+
+  params.enable_singleton_columns = false;
   params.enable_doubleton_equations = false;
   params.enable_dual_fix = false;
-  params.enable_structural_l1_substitution = false;
+  params.enable_absolute_value_epigraph_reduction = false;
 
   GpuPresolveSummary summary = gpu_presolver::presolve::run_gpu_presolve_with_record(lp, params);
+  gpu_presolver::presolve::export_recovery_record(summary.record);
   assert(summary.reduced_rows == 2);
   assert(summary.reduced_cols == 1);
   assert(summary.record.tape.types.size() == 1);
   assert(summary.record.tape_gpu.record_count == 0);
   assert(summary.record.tape_gpu.index_count == 0);
   assert(summary.record.tape_gpu.value_count == 0);
-  assert(summary.record.tape.types[0] == static_cast<std::int32_t>(PostsolveReductionType::DuplicateColumn));
+  assert(summary.record.tape.types[0] == static_cast<std::int32_t>(PostsolveReductionType::ParallelColumn));
   assert((summary.record.tape.indices == std::vector<std::int32_t>{1, 0}));
   assert(std::fabs(summary.record.tape.vals[0] - 2.0) < 1.0e-12);
 
   double* x_red = copy_to_device<double>({5.0});
-  double* y_red = copy_to_device<double>(std::vector<double>(summary.reduced_rows, 0.0));
+  double* y_red = copy_to_device<double>({0.0, 0.0});
   double* z_red = copy_to_device<double>({0.4});
   GpuPostsolveResult result = gpu_presolver::presolve::postsolve_gpu(x_red, y_red, z_red, summary.record);
   const std::vector<double> x = copy_to_host(result.x_org, 2);
@@ -1149,70 +1181,32 @@ void test_duplicate_columnumn_rule_records_globalized_postsolve_tape() {
   cudaFree(lp.AU);
 }
 
-void test_summary_transfers_reduced_model_ownership() {
-  using namespace gpu_presolver::presolve;
-  static_assert(!std::is_copy_constructible_v<GpuPresolveSummary>);
-  static_assert(std::is_nothrow_move_constructible_v<GpuPresolveSummary>);
-  static_assert(std::is_nothrow_move_assignable_v<GpuPresolveSummary>);
-  auto make_owned = [] {
-    GpuPresolveSummary s;
-    s.original_cols = s.reduced_cols = 1;
-    s.reduced_lp.c = copy_to_device<double>({3.0});
-    s.reduced_lp.A.rowPtr = copy_to_device<std::int32_t>({0});
-    s.record.col_red2org = {0};
-    s.owns_reduced_lp = true;
-    return s;
-  };
-  auto source = make_owned();
-  auto moved = std::move(source);
-  assert(!source.owns_reduced_lp && source.reduced_lp.c == nullptr);
-  free_gpu_presolve_reduced_lp(source);
-  auto target = make_owned();
-  target = std::move(moved);  // Must release target's previous allocation.
-  assert(!moved.owns_reduced_lp && moved.reduced_lp.A.rowPtr == nullptr);
-  free_gpu_presolve_reduced_lp(moved);
-  auto& alias = target;
-  target = std::move(alias);  // Self-move must retain the live model.
-  assert(target.owns_reduced_lp && target.reduced_cols == 1);
-  assert((target.record.col_red2org == std::vector<std::int32_t>{0}));
-  assert(copy_to_host(target.reduced_lp.c, 1)[0] == 3.0);
-
-  GpuPresolveSummary borrowed;
-  borrowed.reduced_lp = target.reduced_lp;
-  auto borrowed_moved = std::move(borrowed);
-  assert(!borrowed_moved.owns_reduced_lp && borrowed.reduced_lp.c == nullptr);
-  free_gpu_presolve_reduced_lp(borrowed);
-  free_gpu_presolve_reduced_lp(borrowed_moved);
-  assert(copy_to_host(target.reduced_lp.c, 1)[0] == 3.0);
-  free_gpu_presolve_reduced_lp(target);
-  free_gpu_presolve_reduced_lp(target);
-}
-
 }  // namespace
 
 int main() {
-  test_summary_transfers_reduced_model_ownership();
   test_postsolve_scatter_and_fixed_column_restore();
   test_postsolve_allows_null_reduced_dual_inputs();
   test_postsolve_keeps_unretrieved_fixed_column_dual_tape_based_with_original_model();
   test_presolve_record_drives_fixed_column_postsolve();
-  test_infeasible_fixed_variables_near_fixed_value_is_recorded_for_postsolve();
+  test_infeasible_and_fixed_variables_postsolve(0.0, true);
+  test_infeasible_and_fixed_variables_postsolve(1.0e-8, true);
+  test_infeasible_and_fixed_variables_postsolve(5.0e-7, false);
   test_empty_column_fixed_value_is_recorded_for_postsolve();
-  test_duplicate_columnumn_tape_replay_restores_primal_and_dual();
+  test_parallel_columnumn_tape_replay_restores_primal_and_dual();
   test_doubleton_equations_tape_replay_restores_primal_and_basic_dual();
   test_doubleton_equations_original_model_replay_splits_induced_bound_dual();
   test_sub_col_tape_replay_restores_primal_and_dual();
   test_fixed_col_tape_replay_restores_exact_reduced_cost();
   test_fme_and_eq_to_ineq_tape_replay();
-  test_duplicate_row_original_model_replay_splits_dual_between_rows();
+  test_parallel_row_original_model_replay_splits_dual_between_rows();
   test_deleted_row_and_bound_change_replay_with_original_model();
   test_row_bound_change_replay_refines_live_row_duals_from_original_model();
   test_bound_change_no_row_replay_projects_unprotected_column_dual();
-  test_dual_tape_replay_runs_after_structural_primal_recovery();
+  test_dual_tape_replay_runs_after_absolute_value_epigraph_recovery();
   test_tape_checkpoint_replays_after_structural_primal();
   test_structural_tape_structural_timeline_replays_exact_reverse_order();
   test_postsolve_rejects_invalid_primal_recovery_checkpoint();
-  test_duplicate_columnumn_rule_records_globalized_postsolve_tape();
+  test_parallel_columnumn_rule_records_globalized_postsolve_tape();
   std::cout << "test_gpu_postsolve passed\n";
   return 0;
 }

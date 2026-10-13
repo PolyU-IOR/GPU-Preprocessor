@@ -1,20 +1,18 @@
-#include "mps_reader/mpsreader.hpp"
+#include <cstdint>
+#include "cpu_presolve/mpsreader.hpp"
 
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <cmath>
-#include <cstdlib>
 #include <istream>
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-namespace mps_reader {
+namespace cpu_presolve {
 namespace {
 
 enum class Section {
@@ -45,6 +43,13 @@ struct RowInfo {
   int index = -1;
 };
 
+enum class VarType {
+  kContinuous,
+  kMarkedInteger,
+  kInteger,
+  kBinary,
+};
+
 struct RawModel {
   std::string name;
   std::string objective_row;
@@ -57,6 +62,7 @@ struct RawModel {
   std::vector<double> row_upper;
   std::vector<double> col_lower;
   std::vector<double> col_upper;
+  std::vector<VarType> var_types;
   double obj_constant = 0.0;
 };
 
@@ -185,20 +191,15 @@ double parse_double_fallback(const std::string& token) {
       ch = 'E';
     }
   }
-  char* end = nullptr;
-  errno = 0;
-  const double value = std::strtod(normalized.c_str(), &end);
-  if (end == normalized.c_str() || *end != '\0') {
+  std::size_t consumed = 0;
+  const double value = std::stod(normalized, &consumed);
+  if (consumed != normalized.size()) {
     throw std::invalid_argument("invalid numeric token in MPS: " + token);
-  }
-  // ERANGE can also report a representable, nonzero subnormal double.
-  if (errno == ERANGE && (value == 0.0 || !std::isfinite(value))) {
-    throw std::out_of_range("numeric token out of double range in MPS: " + token);
   }
   return value;
 }
 
-double parse_numeric_token(const std::string& token) {
+double parse_double(const std::string& token) {
   const std::size_t n = token.size();
   std::size_t i = 0;
   bool negative = false;
@@ -280,9 +281,6 @@ double parse_numeric_token(const std::string& token) {
         if (!is_digit(digit)) {
           return parse_double_fallback(token);
         }
-        if (exp_value > (std::numeric_limits<int>::max() - (digit - '0')) / 10) {
-          return parse_double_fallback(token);
-        }
         exp_value = 10 * exp_value + static_cast<int>(digit - '0');
         ++exp_digits;
         ++i;
@@ -290,16 +288,8 @@ double parse_numeric_token(const std::string& token) {
       if (exp_digits == 0) {
         return parse_double_fallback(token);
       }
-      if (exp_value > 308) {
-        return parse_double_fallback(token);
-      }
       const double scale = std::pow(10.0, exp_value);
-      const double scaled = exp_negative ? value / scale : value * scale;
-      if (!std::isfinite(scaled) ||
-          (value != 0.0 && std::abs(scaled) < std::numeric_limits<double>::min())) {
-        return parse_double_fallback(token);
-      }
-      value = scaled;
+      value = exp_negative ? value / scale : value * scale;
     } else {
       return parse_double_fallback(token);
     }
@@ -308,41 +298,7 @@ double parse_numeric_token(const std::string& token) {
   return negative ? -value : value;
 }
 
-double require_finite(double value, std::string_view context) {
-  if (!std::isfinite(value)) {
-    throw std::invalid_argument("non-finite value in MPS: " + std::string(context));
-  }
-  return value;
-}
-
-double parse_double(const std::string& token, bool allow_infinity = false) {
-  const double value = parse_numeric_token(token);
-  if (allow_infinity && std::isinf(value)) {
-    std::string text = token;
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
-      return static_cast<char>(std::tolower(ch));
-    });
-    if (!text.empty() && (text[0] == '+' || text[0] == '-')) {
-      text.erase(0, 1);
-    }
-    // Numeric overflow is an error, even in a bound field.
-    if (text == "inf" || text == "infinity") {
-      return value;
-    }
-  }
-  return require_finite(value, token);
-}
-
-void read_objective_sense(const std::string& sense) {
-  if (sense == "MAX") {
-    throw std::invalid_argument("MPS OBJSENSE MAX is not supported by mps_reader reader");
-  }
-  if (sense != "MIN") {
-    throw std::invalid_argument("unsupported MPS OBJSENSE: " + sense);
-  }
-}
-
-int ensure_col(RawModel& model, const std::string& col_name) {
+int ensure_col(RawModel& model, const std::string& col_name, bool integer_section) {
   const auto found = model.cols.find(col_name);
   if (found != model.cols.end()) {
     return found->second;
@@ -354,6 +310,7 @@ int ensure_col(RawModel& model, const std::string& col_name) {
   model.objective.push_back(0.0);
   model.col_lower.push_back(std::numeric_limits<double>::quiet_NaN());
   model.col_upper.push_back(std::numeric_limits<double>::quiet_NaN());
+  model.var_types.push_back(integer_section ? VarType::kMarkedInteger : VarType::kContinuous);
   return index;
 }
 
@@ -415,11 +372,11 @@ void read_rows_line(RawModel& model, const Card& card) {
   }
 }
 
-void read_columns_line(RawModel& model, const Card& card) {
-  if (card.fields.size() < 3 || card.fields.size() % 2 != 1) {
+void read_columns_line(RawModel& model, const Card& card, bool integer_section) {
+  if (card.fields.size() < 3) {
     throw std::invalid_argument("invalid COLUMNS entry at line " + std::to_string(card.line));
   }
-  const int col = ensure_col(model, card.fields[0]);
+  const int col = ensure_col(model, card.fields[0], integer_section);
   for (std::size_t k = 1; k + 1 < card.fields.size(); k += 2) {
     const std::string& row_name = card.fields[k];
     const double value = parse_double(card.fields[k + 1]);
@@ -429,8 +386,7 @@ void read_columns_line(RawModel& model, const Card& card) {
     }
     if (found_row->second.index < 0) {
       if (row_name == model.objective_row) {
-        auto& cost = model.objective[static_cast<std::size_t>(col)];
-        cost = require_finite(cost + value, "summed objective coefficient");
+        model.objective[static_cast<std::size_t>(col)] += value;
       }
       continue;
     }
@@ -439,7 +395,7 @@ void read_columns_line(RawModel& model, const Card& card) {
 }
 
 void read_rhs_line(RawModel& model, const Card& card, std::string& rhs_name) {
-  if (card.fields.size() < 3 || card.fields.size() % 2 != 1) {
+  if (card.fields.size() < 3) {
     throw std::invalid_argument("invalid RHS entry at line " + std::to_string(card.line));
   }
   if (rhs_name.empty()) {
@@ -487,19 +443,19 @@ void apply_range(RawModel& model, const std::string& row_name, double value) {
   const std::size_t idx = static_cast<std::size_t>(row);
   if (found_row->second.type == 'E') {
     if (value >= 0.0) {
-      model.row_upper[idx] = require_finite(model.row_upper[idx] + value, "ranged row bound");
+      model.row_upper[idx] += value;
     } else {
-      model.row_lower[idx] = require_finite(model.row_lower[idx] + value, "ranged row bound");
+      model.row_lower[idx] += value;
     }
   } else if (found_row->second.type == 'L') {
-    model.row_lower[idx] = require_finite(model.row_upper[idx] - std::fabs(value), "ranged row bound");
+    model.row_lower[idx] = model.row_upper[idx] - std::fabs(value);
   } else if (found_row->second.type == 'G') {
-    model.row_upper[idx] = require_finite(model.row_lower[idx] + std::fabs(value), "ranged row bound");
+    model.row_upper[idx] = model.row_lower[idx] + std::fabs(value);
   }
 }
 
 void read_ranges_line(RawModel& model, const Card& card, std::string& ranges_name) {
-  if (card.fields.size() < 3 || card.fields.size() % 2 != 1) {
+  if (card.fields.size() < 3) {
     throw std::invalid_argument("invalid RANGES entry at line " + std::to_string(card.line));
   }
   if (ranges_name.empty()) {
@@ -519,15 +475,6 @@ void read_bounds_line(RawModel& model, const Card& card, std::string& bounds_nam
   if (card.fields.size() < 3) {
     throw std::invalid_argument("invalid BOUNDS entry at line " + std::to_string(card.line));
   }
-  const std::string& bound_type = card.fields[0];
-  if (bound_type == "BV" || bound_type == "LI" || bound_type == "UI" || bound_type == "SI") {
-    throw std::invalid_argument("integer MPS bounds are not supported (continuous LPs only), line " +
-                                std::to_string(card.line));
-  }
-  const bool no_value = bound_type == "FR" || bound_type == "MI" || bound_type == "PL";
-  if (card.fields.size() > 4 || (!no_value && card.fields.size() != 4)) {
-    throw std::invalid_argument("invalid BOUNDS field count at line " + std::to_string(card.line));
-  }
   if (bounds_name.empty()) {
     bounds_name = card.fields[1];
   }
@@ -535,6 +482,7 @@ void read_bounds_line(RawModel& model, const Card& card, std::string& bounds_nam
     return;
   }
 
+  const std::string& bound_type = card.fields[0];
   const auto found_col = model.cols.find(card.fields[2]);
   if (found_col == model.cols.end()) {
     throw std::invalid_argument("unknown MPS column in BOUNDS: " + card.fields[2]);
@@ -553,18 +501,29 @@ void read_bounds_line(RawModel& model, const Card& card, std::string& bounds_nam
     model.col_upper[col] = inf;
     return;
   }
-  const double value = parse_double(card.fields[3], true);
-  if ((bound_type == "LO" && value == inf) ||
-      (bound_type == "UP" && value == -inf) ||
-      (bound_type == "FX" && !std::isfinite(value))) {
-    throw std::invalid_argument("invalid infinite MPS bound: " + bound_type);
+  if (bound_type == "BV") {
+    model.var_types[col] = VarType::kBinary;
+    model.col_lower[col] = 0.0;
+    model.col_upper[col] = 1.0;
+    return;
   }
+
+  if (card.fields.size() < 4) {
+    throw std::invalid_argument("missing value for MPS bound type: " + bound_type);
+  }
+  const double value = parse_double(card.fields[3]);
   if (bound_type == "LO") {
     model.col_lower[col] = value;
   } else if (bound_type == "UP") {
     model.col_upper[col] = value;
   } else if (bound_type == "FX") {
     model.col_lower[col] = value;
+    model.col_upper[col] = value;
+  } else if (bound_type == "LI") {
+    model.var_types[col] = VarType::kInteger;
+    model.col_lower[col] = value;
+  } else if (bound_type == "UI") {
+    model.var_types[col] = VarType::kInteger;
     model.col_upper[col] = value;
   } else {
     throw std::invalid_argument("unsupported MPS bound type: " + bound_type);
@@ -576,13 +535,17 @@ void finalize_variable_bounds(RawModel& model) {
   for (std::size_t col = 0; col < model.col_lower.size(); ++col) {
     const bool lower_missing = std::isnan(model.col_lower[col]);
     const bool upper_missing = std::isnan(model.col_upper[col]);
+    const VarType type = model.var_types[col];
     if (lower_missing && upper_missing) {
       model.col_lower[col] = 0.0;
-      model.col_upper[col] = inf;
+      model.col_upper[col] = type == VarType::kMarkedInteger ? 1.0 : inf;
     } else if (lower_missing) {
       model.col_lower[col] = model.col_upper[col] < 0.0 ? -inf : 0.0;
     } else if (upper_missing) {
       model.col_upper[col] = inf;
+    }
+    if (type == VarType::kMarkedInteger) {
+      model.var_types[col] = VarType::kInteger;
     }
   }
 }
@@ -590,13 +553,13 @@ void finalize_variable_bounds(RawModel& model) {
 RawModel parse_lines(const std::vector<std::string>& lines, Format format) {
   RawModel model;
   Section section = Section::kNone;
-  bool awaiting_objective_sense = false;
+  bool integer_section = false;
   std::string rhs_name;
   std::string bounds_name;
   std::string ranges_name;
 
   for (std::size_t i = 0; i < lines.size(); ++i) {
-    Card card = format == Format::kFree || section == Section::kObjSense
+    Card card = format == Format::kFree
                     ? read_card_free(lines[i], static_cast<int>(i + 1))
                     : read_card_fixed(lines[i], static_cast<int>(i + 1));
     if (card.is_comment || card.fields.empty()) {
@@ -604,9 +567,6 @@ RawModel parse_lines(const std::vector<std::string>& lines, Format format) {
     }
 
     if (card.is_header) {
-      if (awaiting_objective_sense) {
-        throw std::invalid_argument("missing MPS OBJSENSE value");
-      }
       const std::string& header = card.fields[0];
       if (header == "NAME") {
         if (card.fields.size() >= 2) {
@@ -621,39 +581,31 @@ RawModel parse_lines(const std::vector<std::string>& lines, Format format) {
         throw std::invalid_argument("unknown MPS section header: " + header);
       }
       section = header_to_section(header);
-      if (section == Section::kObjSense) {
-        if (card.fields.size() == 2) {
-          read_objective_sense(card.fields[1]);
-        } else if (card.fields.size() == 1) {
-          awaiting_objective_sense = true;
-        } else {
-          throw std::invalid_argument("invalid MPS OBJSENSE entry");
-        }
-      }
       if (section == Section::kUnsupportedQuadratic) {
-        throw std::invalid_argument("quadratic MPS sections are not supported by mps_reader reader");
+        throw std::invalid_argument("quadratic MPS sections are not supported by cpu_presolve reader");
       }
       continue;
     }
 
     switch (section) {
       case Section::kObjSense:
-        if (!awaiting_objective_sense || card.fields.size() != 1) {
-          throw std::invalid_argument("invalid MPS OBJSENSE entry");
+        if (!card.fields.empty() && card.fields[0] == "MAX") {
+          throw std::invalid_argument("MPS OBJSENSE MAX is not supported by cpu_presolve reader");
         }
-        read_objective_sense(card.fields[0]);
-        awaiting_objective_sense = false;
         break;
       case Section::kRows:
         read_rows_line(model, card);
         break;
       case Section::kColumns:
-        if (card.fields.size() >= 2 &&
-            (card.fields[1] == "'MARKER'" || card.fields[1] == "MARKER")) {
-          throw std::invalid_argument("MPS markers are not supported (continuous LPs only), line " +
-                                      std::to_string(card.line));
+        if (card.fields.size() >= 3 && card.fields[1] == "'MARKER'") {
+          if (card.fields[2] == "'INTORG'") {
+            integer_section = true;
+          } else if (card.fields[2] == "'INTEND'") {
+            integer_section = false;
+          }
+          break;
         }
-        read_columns_line(model, card);
+        read_columns_line(model, card, integer_section);
         break;
       case Section::kRhs:
         read_rhs_line(model, card, rhs_name);
@@ -670,9 +622,6 @@ RawModel parse_lines(const std::vector<std::string>& lines, Format format) {
     }
   }
 
-  if (awaiting_objective_sense) {
-    throw std::invalid_argument("missing MPS OBJSENSE value");
-  }
   if (model.row_types.empty() && model.cols.empty()) {
     throw std::invalid_argument("empty MPS model");
   }
@@ -681,7 +630,7 @@ RawModel parse_lines(const std::vector<std::string>& lines, Format format) {
 }
 
 MpsModel build_model(RawModel model) {
-  std::vector<int> col_ptr;
+  std::vector<std::int64_t> col_ptr;
   std::vector<int> row_idx;
   std::vector<double> values;
   col_ptr.reserve(model.col_entries.size() + 1);
@@ -707,12 +656,11 @@ MpsModel build_model(RawModel model) {
         value += entries[end].second;
         ++end;
       }
-      require_finite(value, "summed matrix coefficient");
       row_idx.push_back(row);
       values.push_back(value);
       begin = end;
     }
-    col_ptr.push_back(static_cast<int>(values.size()));
+    col_ptr.push_back(static_cast<std::int64_t>(values.size()));
   }
 
   LpModel lp(
@@ -757,4 +705,4 @@ MpsModel read_mps(std::istream& input) {
   }
 }
 
-}  // namespace mps_reader
+}  // namespace cpu_presolve

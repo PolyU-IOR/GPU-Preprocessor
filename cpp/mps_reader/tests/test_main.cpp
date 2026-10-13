@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-namespace mps_reader_tests {
+namespace cpu_presolve_tests {
 namespace {
 
 std::vector<std::pair<std::string, TestFn>>& registry() {
@@ -34,8 +34,8 @@ int run_all_tests() {
   return failed == 0 ? 0 : 1;
 }
 
-}  // namespace mps_reader_tests
+}  // namespace cpu_presolve_tests
 
 int main() {
-  return mps_reader_tests::run_all_tests();
+  return cpu_presolve_tests::run_all_tests();
 }

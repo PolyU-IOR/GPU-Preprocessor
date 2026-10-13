@@ -1,28 +1,33 @@
-#include "presolve_helpers.hpp"
+#include "gpu_presolver/detail/runtime_options.hpp"
+#include "gpu_presolver/presolve/cleanup_workspace.hpp"
+#include "gpu_presolver/offset.hpp"
+#include "gpu_presolver/presolve/device_recovery.hpp"
+#include "gpu_presolver/presolve/duplicate_rule_workspace.hpp"
 #include "gpu_presolver/presolve/gpu_presolve.hpp"
+#include "gpu_presolver/presolve/identity_plan.hpp"
+#include "gpu_presolver/presolve/gpu_presolve_kernels.hpp"
+#include "gpu_presolver/presolve/stable_mapping.hpp"
+#include "gpu_presolver/presolve/transpose64.hpp"
 
-#include "gpu_presolver/presolve/rules/rule_antipodal_components.hpp"
-#include "gpu_presolver/presolve/rules/rule_bounded_two_row_projection.hpp"
-#include "gpu_presolver/presolve/rules/rule_covering_cost_dominance.hpp"
-#include "gpu_presolver/presolve/rules/rule_infeasible_redundant_rows.hpp"
-#include "gpu_presolver/presolve/rules/rule_infeasible_fixed_variables.hpp"
+#include "gpu_presolver/presolve/rules/rule_variable_pair_aggregation.hpp"
+#include "plan_storage.hpp"
+#include "gpu_presolver/presolve/rules/rule_two_row_variable_elimination.hpp"
+#include "gpu_presolver/presolve/rules/rule_column_domination.hpp"
+#include "gpu_presolver/presolve/rules/rule_infeasible_and_redundant_rows.hpp"
+#include "gpu_presolver/presolve/rules/rule_infeasible_and_fixed_variables.hpp"
 #include "gpu_presolver/presolve/rules/rule_doubleton_equations.hpp"
 #include "gpu_presolver/presolve/rules/rule_dual_fix.hpp"
-#include "gpu_presolver/presolve/rules/rule_empty_cols.hpp"
-#include "gpu_presolver/presolve/rules/rule_empty_rows.hpp"
-#include "gpu_presolver/presolve/rules/rule_linf_components.hpp"
-#include "gpu_presolver/presolve/rules/rule_duplicate_columns.hpp"
-#include "gpu_presolver/presolve/rules/rule_duplicate_rows.hpp"
-#include "gpu_presolver/presolve/rules/rule_orphan_mccormick_projection.hpp"
-#include "gpu_presolver/presolve/rules/rule_implied_variable_bounds.hpp"
-#include "gpu_presolver/presolve/rules/rule_redundant_bounds.hpp"
-#include "gpu_presolver/presolve/rules/rule_column_singletons.hpp"
+#include "gpu_presolver/presolve/rules/rule_empty_rows_and_columns.hpp"
+#include "gpu_presolver/presolve/rules/rule_parallel_columns.hpp"
+#include "gpu_presolver/presolve/rules/rule_parallel_rows.hpp"
+#include "gpu_presolver/presolve/rules/rule_mccormick_variable_elimination.hpp"
+#include "gpu_presolver/presolve/rules/rule_bound_strengthening.hpp"
+#include "gpu_presolver/presolve/rules/rule_singleton_columns.hpp"
 #include "gpu_presolver/presolve/rules/rule_singleton_rows.hpp"
-#include "gpu_presolver/presolve/rules/rule_structural_l1_substitution.hpp"
+#include "gpu_presolver/presolve/rules/rule_absolute_value_epigraph_reduction.hpp"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
-#include <cusparse.h>
 
 #include <algorithm>
 #include <chrono>
@@ -30,31 +35,33 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace gpu_presolver::presolve {
 namespace {
 
-using detail::throw_if_cuda_error;
-using detail::env_enabled;
-
 constexpr std::int32_t SPARSE_FIXED_BOUND_RECORD_THRESHOLD = 65536;
 constexpr std::int32_t COMPACT_LONG_ROW_THRESHOLD = 1024;
 constexpr std::int32_t PARALLEL_IDENTITY_FILL_THRESHOLD = 1 << 20;
 constexpr unsigned PARALLEL_IDENTITY_FILL_MAX_THREADS = 8;
 
-void throw_if_cusparse_error(cusparseStatus_t status, const char* context) {
-  if (status == CUSPARSE_STATUS_SUCCESS) {
+void throw_if_cuda_error(cudaError_t status, const char* context) {
+  if (status == cudaSuccess) {
     return;
   }
-  throw std::runtime_error(std::string(context) + ": cusparse status " +
-                           std::to_string(static_cast<int>(status)));
+  throw std::runtime_error(
+      std::string(context) + ": " + cudaGetErrorString(status));
 }
+
+#include "diagnostic_snapshot.hpp"
 
 template <class T>
 cudaError_t stream_ordered_malloc(T** pointer, std::size_t bytes) {
@@ -65,7 +72,8 @@ cudaError_t stream_ordered_free(void* pointer) {
   return pointer == nullptr ? cudaSuccess : cudaFreeAsync(pointer, nullptr);
 }
 
-void inclusive_scan_i32(std::int32_t* values, std::int32_t n, const char* context) {
+template <typename T>
+void inclusive_scan_i32(T* values, std::int32_t n, const char* context) {
   if (n <= 0) {
     return;
   }
@@ -74,211 +82,24 @@ void inclusive_scan_i32(std::int32_t* values, std::int32_t n, const char* contex
   throw_if_cuda_error(
       cub::DeviceScan::InclusiveSum(temp_storage, temp_bytes, values, values, n),
       context);
-  throw_if_cuda_error(stream_ordered_malloc(&temp_storage, temp_bytes), context);
+  CleanupScratchFrame scratch;
+  temp_storage = scratch.get<unsigned char>(6, temp_bytes);
   throw_if_cuda_error(
       cub::DeviceScan::InclusiveSum(temp_storage, temp_bytes, values, values, n),
       context);
-  stream_ordered_free(temp_storage);
-}
-
-void append_rule_name(std::string& rules, const char* name) {
-  if (!rules.empty()) {
-    rules += ",";
-  }
-  rules += name;
 }
 
 __global__ void _kernel_fill_u8(std::uint8_t* data, std::uint8_t value, std::int32_t n) {
-  const std::int32_t j = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t j = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (j < n) {
     data[j] = value;
-  }
-}
-
-__global__ void _kernel_update_row_degrees_from_removed_cols(
-    std::int32_t* row_nnz,
-    const std::uint8_t* keep_col_before,
-    const std::uint8_t* keep_col_after,
-    const std::uint8_t* keep_row_after,
-    const std::int32_t* at_row_ptr,
-    const std::int32_t* at_col_val,
-    std::int32_t n) {
-  const std::int32_t col =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (col >= n || keep_col_before[col] == std::uint8_t{0} ||
-      keep_col_after[col] != std::uint8_t{0}) {
-    return;
-  }
-  for (std::int32_t p = at_row_ptr[col]; p < at_row_ptr[col + 1]; ++p) {
-    const std::int32_t row = at_col_val[p];
-    if (keep_row_after[row] != std::uint8_t{0}) {
-      atomicSub(&row_nnz[row], 1);
-    }
-  }
-}
-
-__global__ void _kernel_update_col_degrees_from_removed_rows(
-    std::int32_t* col_nnz,
-    const std::uint8_t* keep_row_before,
-    const std::uint8_t* keep_row_after,
-    const std::uint8_t* keep_col_after,
-    const std::int32_t* row_ptr,
-    const std::int32_t* col_val,
-    std::int32_t m) {
-  const std::int32_t row =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (row >= m || keep_row_before[row] == std::uint8_t{0} ||
-      keep_row_after[row] != std::uint8_t{0}) {
-    return;
-  }
-  for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
-    const std::int32_t col = col_val[p];
-    if (keep_col_after[col] != std::uint8_t{0}) {
-      atomicSub(&col_nnz[col], 1);
-    }
-  }
-}
-
-__global__ void _kernel_refresh_singleton_rows_from_degrees(
-    std::uint8_t* singleton_mask,
-    std::int32_t* column_singleton,
-    double* singleton_val,
-    const std::int32_t* row_nnz,
-    const std::uint8_t* keep_row,
-    const std::uint8_t* keep_col,
-    const std::int32_t* row_ptr,
-    const std::int32_t* col_val,
-    const double* nz_val,
-    std::int32_t m) {
-  const std::int32_t row =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (row >= m) return;
-  const bool is_singleton = keep_row[row] != std::uint8_t{0} && row_nnz[row] == 1;
-  singleton_mask[row] = is_singleton ? std::uint8_t{1} : std::uint8_t{0};
-  column_singleton[row] = -1;
-  singleton_val[row] = 0.0;
-  if (!is_singleton) return;
-  for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
-    const std::int32_t col = col_val[p];
-    if (keep_col[col] != std::uint8_t{0}) {
-      column_singleton[row] = col;
-      singleton_val[row] = nz_val[p];
-      return;
-    }
-  }
-}
-
-__global__ void _kernel_refresh_column_singletons_from_degrees(
-    std::uint8_t* singleton_mask,
-    std::int32_t* singleton_row,
-    double* singleton_val,
-    const std::int32_t* col_nnz,
-    const std::uint8_t* keep_row,
-    const std::uint8_t* keep_col,
-    const std::int32_t* at_row_ptr,
-    const std::int32_t* at_col_val,
-    const double* at_nz_val,
-    std::int32_t n) {
-  const std::int32_t col =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (col >= n) return;
-  const bool is_singleton = keep_col[col] != std::uint8_t{0} && col_nnz[col] == 1;
-  singleton_mask[col] = is_singleton ? std::uint8_t{1} : std::uint8_t{0};
-  singleton_row[col] = -1;
-  singleton_val[col] = 0.0;
-  if (!is_singleton) return;
-  for (std::int32_t p = at_row_ptr[col]; p < at_row_ptr[col + 1]; ++p) {
-    const std::int32_t row = at_col_val[p];
-    if (keep_row[row] != std::uint8_t{0}) {
-      singleton_row[col] = row;
-      singleton_val[col] = at_nz_val[p];
-      return;
-    }
-  }
-}
-
-__global__ void _kernel_mark_changed_dual_cols(
-    std::uint8_t* candidate_mask,
-    const std::uint8_t* keep_col,
-    const double* c,
-    const double* l,
-    const double* u,
-    const double* c_seen,
-    const double* l_seen,
-    const double* u_seen,
-    std::int32_t n) {
-  const std::int32_t col =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (col < n) {
-    candidate_mask[col] =
-        keep_col[col] != std::uint8_t{0} &&
-                (c[col] != c_seen[col] || l[col] != l_seen[col] ||
-                 u[col] != u_seen[col])
-            ? std::uint8_t{1}
-            : std::uint8_t{0};
-  }
-}
-
-__global__ void _kernel_mark_dual_cols_from_changed_rows(
-    std::uint8_t* candidate_mask,
-    const std::uint8_t* keep_row,
-    const std::uint8_t* keep_col,
-    const double* AL,
-    const double* AU,
-    const std::uint8_t* keep_row_seen,
-    const double* AL_seen,
-    const double* AU_seen,
-    const std::int32_t* row_ptr,
-    const std::int32_t* col_val,
-    std::int32_t m) {
-  const std::int32_t row =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (row >= m ||
-      (keep_row[row] == keep_row_seen[row] && AL[row] == AL_seen[row] &&
-       AU[row] == AU_seen[row])) {
-    return;
-  }
-  for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
-    const std::int32_t col = col_val[p];
-    if (keep_col[col] != std::uint8_t{0}) {
-      candidate_mask[col] = std::uint8_t{1};
-    }
-  }
-}
-
-__global__ void _kernel_compute_csr_row_stats(std::int32_t* row_nnz,
-                                              std::uint8_t* empty_row_mask,
-                                              std::uint8_t* singleton_row_mask,
-                                              std::int32_t* singleton_row_col,
-                                              double* singleton_row_val,
-                                              const std::int32_t* row_ptr,
-                                              const std::int32_t* col_val,
-                                              const double* nz_val,
-                                              std::int32_t rows) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (i < rows) {
-    const std::int32_t first = row_ptr[i];
-    const std::int32_t count = row_ptr[i + 1] - first;
-    if (row_nnz != nullptr) row_nnz[i] = count;
-    if (empty_row_mask != nullptr) {
-      empty_row_mask[i] = count == 0 ? std::uint8_t{1} : std::uint8_t{0};
-    }
-    if (singleton_row_mask != nullptr) {
-      singleton_row_mask[i] = count == 1 ? std::uint8_t{1} : std::uint8_t{0};
-    }
-    if (singleton_row_col != nullptr) {
-      singleton_row_col[i] = count == 1 ? col_val[first] : -1;
-    }
-    if (singleton_row_val != nullptr) {
-      singleton_row_val[i] = count == 1 ? nz_val[first] : 0.0;
-    }
   }
 }
 
 __global__ void _kernel_mask_to_prefix_i32(std::int32_t* out,
                                            const std::uint8_t* mask,
                                            std::int32_t n) {
-  const std::int32_t j = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t j = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (j < n) {
     out[j] = mask[j] != std::uint8_t{0} ? 1 : 0;
   }
@@ -288,22 +109,25 @@ __global__ void _kernel_old_to_new_from_prefix(std::int32_t* old_to_new,
                                                const std::uint8_t* mask,
                                                const std::int32_t* prefix,
                                                std::int32_t n) {
-  const std::int32_t j = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t j = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (j < n) {
     old_to_new[j] = mask[j] != std::uint8_t{0} ? prefix[j] - 1 : -1;
   }
 }
 
-__global__ void _kernel_count_compacted_rows(std::int32_t* row_counts_new,
+__global__ void _kernel_count_compacted_rows(NnzOffset* row_counts_new,
                                              const std::int32_t* row_old_to_new,
                                              const std::int32_t* col_old_to_new,
-                                             const std::int32_t* row_ptr,
+                                             const NnzOffset* row_ptr,
                                              const std::int32_t* col_val,
                                              std::int32_t* long_rows,
                                              std::int32_t* long_row_count,
                                              std::int32_t long_row_threshold,
-                                             std::int32_t m_old) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+                                             std::int32_t m_old,
+                                             std::int32_t* medium_rows,
+                                             std::int32_t* medium_row_count,
+                                             std::int32_t medium_row_threshold) {
+  const std::int32_t row = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (row < m_old) {
     const std::int32_t row_new = row_old_to_new[row];
     if (row_new < 0) {
@@ -311,11 +135,18 @@ __global__ void _kernel_count_compacted_rows(std::int32_t* row_counts_new,
     }
     if (row_ptr[row + 1] - row_ptr[row] > long_row_threshold) {
       const std::int32_t slot = atomicAdd(long_row_count, 1);
-      long_rows[slot] = row;
+      // Medium rows grow from the front, long rows from the back. Since a
+      // kept row belongs to at most one queue, their slots cannot overlap.
+      long_rows[medium_rows != nullptr ? m_old - 1 - slot : slot] = row;
+      return;
+    }
+    if (row_ptr[row + 1] - row_ptr[row] > medium_row_threshold) {
+      const std::int32_t slot = atomicAdd(medium_row_count, 1);
+      medium_rows[slot] = row;
       return;
     }
     std::int32_t count = 0;
-    for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
+    for (NnzOffset p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
       if (col_old_to_new[col_val[p]] >= 0) {
         ++count;
       }
@@ -324,11 +155,39 @@ __global__ void _kernel_count_compacted_rows(std::int32_t* row_counts_new,
   }
 }
 
+// Each warp owns one row. Integer ballots preserve entry order and copy
+// coefficient bits unchanged, independently of queue insertion order.
+__global__ void _kernel_compact_medium_rows(
+    NnzOffset* counts, std::int32_t* cols_out, double* vals_out,
+    const NnzOffset* ptr_out, const std::int32_t* row_map,
+    const std::int32_t* col_map, const NnzOffset* ptr,
+    const std::int32_t* cols, const double* vals,
+    const std::int32_t* rows, std::int32_t row_count) {
+  const int lane = threadIdx.x & 31;
+  const NnzOffset q = (NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  if (q >= row_count) return;
+  const int row = rows[q], row_new = row_map[row];
+  int count = 0;
+  for (std::int64_t chunk = ptr[row]; chunk < ptr[row + 1]; chunk += 32) {
+    const std::int64_t p = chunk + lane;
+    const int col = p < ptr[row + 1] ? col_map[cols[p]] : -1;
+    const unsigned mask = __ballot_sync(0xffffffffu, col >= 0);
+    if (cols_out != nullptr && col >= 0) {
+      const unsigned preceding = mask & ((1u << lane) - 1u);
+      const NnzOffset out = ptr_out[row_new] + count + __popc(preceding);
+      cols_out[out] = col;
+      vals_out[out] = vals[p];
+    }
+    count += __popc(mask);
+  }
+  if (counts != nullptr && lane == 0) counts[row_new] = count;
+}
+
 __global__ void _kernel_count_compacted_long_rows(
-    std::int32_t* row_counts_new,
+    NnzOffset* row_counts_new,
     const std::int32_t* row_old_to_new,
     const std::int32_t* col_old_to_new,
-    const std::int32_t* row_ptr,
+    const NnzOffset* row_ptr,
     const std::int32_t* col_val,
     const std::int32_t* long_rows,
     std::int32_t long_row_count) {
@@ -338,7 +197,7 @@ __global__ void _kernel_count_compacted_long_rows(
   }
   const std::int32_t row = long_rows[long_index];
   std::int32_t count = 0;
-  for (std::int32_t p = row_ptr[row] + static_cast<std::int32_t>(threadIdx.x);
+  for (NnzOffset p = row_ptr[row] + static_cast<NnzOffset>(threadIdx.x);
        p < row_ptr[row + 1]; p += static_cast<std::int32_t>(blockDim.x)) {
     count += col_old_to_new[col_val[p]] >= 0 ? 1 : 0;
   }
@@ -346,7 +205,7 @@ __global__ void _kernel_count_compacted_long_rows(
   const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
   shared_counts[tid] = count;
   __syncthreads();
-  for (std::int32_t stride = 128; stride > 0; stride >>= 1) {
+  for (NnzOffset stride = 128; stride > 0; stride >>= 1) {
     if (tid < stride) {
       shared_counts[tid] += shared_counts[tid + stride];
     }
@@ -358,10 +217,10 @@ __global__ void _kernel_count_compacted_long_rows(
 }
 
 __global__ void _kernel_count_compacted_rows_block(
-    std::int32_t* row_counts_new,
+    NnzOffset* row_counts_new,
     const std::int32_t* row_old_to_new,
     const std::int32_t* col_old_to_new,
-    const std::int32_t* row_ptr,
+    const NnzOffset* row_ptr,
     const std::int32_t* col_val,
     std::int32_t m_old) {
   const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
@@ -373,7 +232,7 @@ __global__ void _kernel_count_compacted_rows_block(
     return;
   }
   std::int32_t local_count = 0;
-  for (std::int32_t p = row_ptr[row] + static_cast<std::int32_t>(threadIdx.x);
+  for (NnzOffset p = row_ptr[row] + static_cast<NnzOffset>(threadIdx.x);
        p < row_ptr[row + 1]; p += static_cast<std::int32_t>(blockDim.x)) {
     local_count += col_old_to_new[col_val[p]] >= 0 ? 1 : 0;
   }
@@ -385,10 +244,10 @@ __global__ void _kernel_count_compacted_rows_block(
   }
 }
 
-__global__ void _kernel_row_ptr_from_prefix(std::int32_t* row_ptr,
-                                            const std::int32_t* prefix,
+__global__ void _kernel_row_ptr_from_prefix(NnzOffset* row_ptr,
+                                            const NnzOffset* prefix,
                                             std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i == 0) {
     row_ptr[0] = 0;
   }
@@ -399,15 +258,15 @@ __global__ void _kernel_row_ptr_from_prefix(std::int32_t* row_ptr,
 
 __global__ void _kernel_copy_compacted_rows(std::int32_t* col_val_new,
                                             double* nz_val_new,
-                                            const std::int32_t* row_ptr_new,
+                                            const NnzOffset* row_ptr_new,
                                             const std::int32_t* row_old_to_new,
                                             const std::int32_t* col_old_to_new,
-                                            const std::int32_t* row_ptr,
+                                            const NnzOffset* row_ptr,
                                             const std::int32_t* col_val,
                                             const double* nz_val,
                                             std::int32_t long_row_threshold,
                                             std::int32_t m_old) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t row = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (row < m_old) {
     const std::int32_t row_new = row_old_to_new[row];
     if (row_new < 0) {
@@ -416,8 +275,8 @@ __global__ void _kernel_copy_compacted_rows(std::int32_t* col_val_new,
     if (row_ptr[row + 1] - row_ptr[row] > long_row_threshold) {
       return;
     }
-    std::int32_t write = row_ptr_new[row_new];
-    for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
+    NnzOffset write = row_ptr_new[row_new];
+    for (NnzOffset p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
       const std::int32_t col_new = col_old_to_new[col_val[p]];
       if (col_new >= 0) {
         col_val_new[write] = col_new;
@@ -431,10 +290,10 @@ __global__ void _kernel_copy_compacted_rows(std::int32_t* col_val_new,
 __global__ void _kernel_copy_compacted_long_rows(
     std::int32_t* col_val_new,
     double* nz_val_new,
-    const std::int32_t* row_ptr_new,
+    const NnzOffset* row_ptr_new,
     const std::int32_t* row_old_to_new,
     const std::int32_t* col_old_to_new,
-    const std::int32_t* row_ptr,
+    const NnzOffset* row_ptr,
     const std::int32_t* col_val,
     const double* nz_val,
     const std::int32_t* long_rows,
@@ -447,20 +306,20 @@ __global__ void _kernel_copy_compacted_long_rows(
   const std::int32_t row_new = row_old_to_new[row];
   const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
   __shared__ std::int32_t scan[256];
-  __shared__ std::int32_t base;
+  __shared__ NnzOffset base;
   if (tid == 0) {
     base = 0;
   }
   __syncthreads();
-  for (std::int32_t chunk = row_ptr[row]; chunk < row_ptr[row + 1]; chunk += 256) {
-    const std::int32_t p = chunk + tid;
+  for (NnzOffset chunk = row_ptr[row]; chunk < row_ptr[row + 1]; chunk += 256) {
+    const NnzOffset p = chunk + tid;
     std::int32_t col_new = -1;
     if (p < row_ptr[row + 1]) {
       col_new = col_old_to_new[col_val[p]];
     }
     scan[tid] = col_new >= 0 ? 1 : 0;
     __syncthreads();
-    for (std::int32_t offset = 1; offset < 256; offset <<= 1) {
+    for (int offset = 1; offset < 256; offset <<= 1) {
       const std::int32_t value =
           scan[tid] + (tid >= offset ? scan[tid - offset] : 0);
       __syncthreads();
@@ -468,7 +327,7 @@ __global__ void _kernel_copy_compacted_long_rows(
       __syncthreads();
     }
     if (col_new >= 0) {
-      const std::int32_t write = row_ptr_new[row_new] + base + scan[tid] - 1;
+      const NnzOffset write = row_ptr_new[row_new] + base + scan[tid] - 1;
       col_val_new[write] = col_new;
       nz_val_new[write] = nz_val[p];
     }
@@ -484,32 +343,34 @@ __global__ void _kernel_copy_compacted_long_rows(
 __global__ void _kernel_copy_compacted_rows_block(
     std::int32_t* col_val_new,
     double* nz_val_new,
-    const std::int32_t* row_ptr_new,
+    const NnzOffset* row_ptr_new,
     const std::int32_t* row_old_to_new,
     const std::int32_t* col_old_to_new,
-    const std::int32_t* row_ptr,
+    const NnzOffset* row_ptr,
     const std::int32_t* col_val,
     const double* nz_val,
-    std::int32_t m_old) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
-  if (row >= m_old) {
+    std::int32_t work_count,
+    const std::int32_t* row_ids = nullptr) {
+  const std::int32_t work = static_cast<std::int32_t>(blockIdx.x);
+  if (work >= work_count) {
     return;
   }
+  const std::int32_t row = row_ids == nullptr ? work : row_ids[work];
   const std::int32_t row_new = row_old_to_new[row];
   if (row_new < 0) {
     return;
   }
   using BlockScan = cub::BlockScan<std::int32_t, 256>;
   __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ std::int32_t row_write_offset;
+  __shared__ NnzOffset row_write_offset;
   if (threadIdx.x == 0) {
     row_write_offset = 0;
   }
   __syncthreads();
-  const std::int32_t row_stop = row_ptr[row + 1];
-  for (std::int32_t chunk = row_ptr[row]; chunk < row_stop;
+  const NnzOffset row_stop = row_ptr[row + 1];
+  for (NnzOffset chunk = row_ptr[row]; chunk < row_stop;
        chunk += 256) {
-    const std::int32_t p = chunk + static_cast<std::int32_t>(threadIdx.x);
+    const NnzOffset p = chunk + static_cast<NnzOffset>(threadIdx.x);
     const std::int32_t col_new =
         p < row_stop ? col_old_to_new[col_val[p]] : -1;
     const std::int32_t keep = col_new >= 0 ? 1 : 0;
@@ -517,7 +378,7 @@ __global__ void _kernel_copy_compacted_rows_block(
     std::int32_t chunk_count = 0;
     BlockScan(scan_storage).ExclusiveSum(keep, prefix, chunk_count);
     if (keep != 0) {
-      const std::int32_t write =
+      const NnzOffset write =
           row_ptr_new[row_new] + row_write_offset + prefix;
       col_val_new[write] = col_new;
       nz_val_new[write] = nz_val[p];
@@ -534,7 +395,7 @@ __global__ void _kernel_gather_by_old_to_new(double* dst,
                                              const double* src,
                                              const std::int32_t* old_to_new,
                                              std::int32_t n_old) {
-  const std::int32_t j = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t j = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (j < n_old) {
     const std::int32_t mapped = old_to_new[j];
     if (mapped >= 0) {
@@ -553,11 +414,11 @@ __global__ void _kernel_identity_red2org_from_old_to_new(
     std::int32_t n_old) {
   using BlockReduce = cub::BlockReduce<std::int32_t, 256>;
   __shared__ typename BlockReduce::TempStorage reduce_storage;
-  const std::int32_t old_index =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const NnzOffset old_index =
+      static_cast<NnzOffset>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   std::int32_t removed_fixed = 0;
   if (old_index < n_old) {
-    const std::int32_t new_index = old_to_new[old_index];
+    const NnzOffset new_index = old_to_new[old_index];
     if (new_index >= 0) {
       red2org[new_index] = old_index;
     } else if (isfinite(l[old_index]) && isfinite(u[old_index]) &&
@@ -573,10 +434,11 @@ __global__ void _kernel_identity_red2org_from_old_to_new(
 
 struct StatsRequirements {
   bool row_nnz = false;
+  bool empty_rows = false;
   bool singleton_rows = false;
   bool col_nnz = false;
-  bool empty_cols = false;
-  bool column_singletons = false;
+  bool empty_columns = false;
+  bool singleton_columns = false;
 };
 
 void allocate_stats(PresolveStatsGpu& stats,
@@ -625,12 +487,12 @@ void allocate_stats(PresolveStatsGpu& stats,
   SideOffsets row_offsets;
   SideOffsets col_offsets;
   std::size_t total_bytes = 0;
-  const bool need_rows = needs.row_nnz || needs.singleton_rows;
-  const bool need_cols = needs.col_nnz || needs.empty_cols || needs.column_singletons;
+  const bool need_rows = needs.row_nnz || needs.empty_rows || needs.singleton_rows;
+  const bool need_cols = needs.col_nnz || needs.empty_columns || needs.singleton_columns;
   if (need_rows && row_count > 0) {
     layout_side(row_count,
                 needs.row_nnz,
-                false,
+                needs.empty_rows,
                 needs.singleton_rows,
                 row_offsets,
                 total_bytes);
@@ -638,8 +500,8 @@ void allocate_stats(PresolveStatsGpu& stats,
   if (need_cols && col_count > 0) {
     layout_side(col_count,
                 needs.col_nnz,
-                needs.empty_cols,
-                needs.column_singletons,
+                needs.empty_columns,
+                needs.singleton_columns,
                 col_offsets,
                 total_bytes);
   }
@@ -654,6 +516,7 @@ void allocate_stats(PresolveStatsGpu& stats,
     if (needs.row_nnz) {
       stats.row_nnz = reinterpret_cast<std::int32_t*>(storage + row_offsets.nnz);
     }
+    if (needs.empty_rows) stats.empty_row_mask = storage + row_offsets.empty_mask;
     if (needs.singleton_rows) {
       stats.singleton_row_mask = storage + row_offsets.singleton_mask;
       stats.singleton_row_col =
@@ -666,12 +529,12 @@ void allocate_stats(PresolveStatsGpu& stats,
     if (needs.col_nnz) {
       stats.col_nnz = reinterpret_cast<std::int32_t*>(storage + col_offsets.nnz);
     }
-    if (needs.empty_cols) stats.empty_col_mask = storage + col_offsets.empty_mask;
-    if (needs.column_singletons) {
-      stats.column_singleton_mask = storage + col_offsets.singleton_mask;
-      stats.column_singleton_row =
+    if (needs.empty_columns) stats.empty_col_mask = storage + col_offsets.empty_mask;
+    if (needs.singleton_columns) {
+      stats.singleton_column_mask = storage + col_offsets.singleton_mask;
+      stats.singleton_column_row =
           reinterpret_cast<std::int32_t*>(storage + col_offsets.singleton_index);
-      stats.column_singleton_val =
+      stats.singleton_column_val =
           reinterpret_cast<double*>(storage + col_offsets.singleton_value);
     }
   }
@@ -682,67 +545,29 @@ void free_stats(PresolveStatsGpu& stats) {
     stream_ordered_free(stats.contiguous_storage);
   } else {
     stream_ordered_free(stats.row_nnz);
+    stream_ordered_free(stats.empty_row_mask);
     stream_ordered_free(stats.singleton_row_mask);
     stream_ordered_free(stats.singleton_row_col);
     stream_ordered_free(stats.singleton_row_val);
     stream_ordered_free(stats.col_nnz);
     stream_ordered_free(stats.empty_col_mask);
-    stream_ordered_free(stats.column_singleton_mask);
-    stream_ordered_free(stats.column_singleton_row);
-    stream_ordered_free(stats.column_singleton_val);
+    stream_ordered_free(stats.singleton_column_mask);
+    stream_ordered_free(stats.singleton_column_row);
+    stream_ordered_free(stats.singleton_column_val);
   }
 }
 
-void recompute_row_stats_from_csr(PresolveStatsGpu& stats, const LPInfoGpu& lp) {
-  if (lp.A.rows <= 0) {
-    return;
-  }
-  constexpr int threads = 256;
-  const int row_blocks = (lp.A.rows + threads - 1) / threads;
-  _kernel_compute_csr_row_stats<<<row_blocks, threads>>>(
-      stats.row_nnz,
-      nullptr,
-      stats.singleton_row_mask,
-      stats.singleton_row_col,
-      stats.singleton_row_val,
-      lp.A.rowPtr,
-      lp.A.colVal,
-      lp.A.nzVal,
-      lp.A.rows);
-  throw_if_cuda_error(cudaGetLastError(), "_kernel_compute_csr_row_stats row");
-}
+}  // namespace
 
-void recompute_col_stats_from_csr(PresolveStatsGpu& stats, const LPInfoGpu& lp) {
-  if (lp.A.cols <= 0) {
-    return;
-  }
-  constexpr int threads = 256;
-  const int col_blocks = (lp.A.cols + threads - 1) / threads;
-  _kernel_compute_csr_row_stats<<<col_blocks, threads>>>(
-      stats.col_nnz,
-      stats.empty_col_mask,
-      stats.column_singleton_mask,
-      stats.column_singleton_row,
-      stats.column_singleton_val,
-      lp.AT.rowPtr,
-      lp.AT.colVal,
-      lp.AT.nzVal,
-      lp.A.cols);
-  throw_if_cuda_error(cudaGetLastError(), "_kernel_compute_csr_row_stats col");
-}
-
-struct PlanRequirements {
-  bool objective = true;
-  bool col_bounds = true;
-  bool row_bounds = true;
-};
+namespace detail {
 
 void allocate_plan(PresolvePlanGpu& plan,
                    const LPInfoGpu& lp,
                    const PlanRequirements& needs) {
+  plan.tape.resident = device_recovery_enabled();
   const std::int32_t m = lp.A.rows;
   const std::int32_t n = lp.A.cols;
-  const bool profile_alloc = env_enabled("GPUPRESOLVER_PRESOLVE_ALLOC_PROFILE");
+  const bool profile_alloc = runtime::options().profile_allocations;
   const auto alloc_start = std::chrono::steady_clock::now();
   auto after_mask_alloc = alloc_start;
   auto after_vector_alloc = alloc_start;
@@ -849,7 +674,9 @@ void allocate_plan(PresolvePlanGpu& plan,
 }
 
 void free_plan(PresolvePlanGpu& plan) {
-  const bool profile_alloc = env_enabled("GPUPRESOLVER_PRESOLVE_ALLOC_PROFILE");
+  plan.absolute_value_epigraph_device.reset();
+  plan.variable_pair_aggregation_device.reset();
+  const bool profile_alloc = runtime::options().profile_allocations;
   const auto free_start = std::chrono::steady_clock::now();
   if (plan.contiguous_storage != nullptr) {
     stream_ordered_free(plan.contiguous_storage);
@@ -875,6 +702,13 @@ void free_plan(PresolvePlanGpu& plan) {
   }
 }
 
+}  // namespace detail
+
+namespace {
+using detail::PlanRequirements;
+using detail::allocate_plan;
+using detail::free_plan;
+
 std::int32_t build_prefix_from_mask(std::int32_t* prefix,
                                     const std::uint8_t* mask,
                                     std::int32_t n) {
@@ -899,18 +733,16 @@ std::int32_t* build_old_to_new(const std::uint8_t* mask,
     *count_out = 0;
     return nullptr;
   }
-  std::int32_t* prefix = nullptr;
+  CleanupScratchFrame scratch;
+  auto* prefix = scratch.get<std::int32_t>(0, n);
   std::int32_t* old_to_new = nullptr;
-  throw_if_cuda_error(cudaMalloc(&prefix, sizeof(std::int32_t) * static_cast<std::size_t>(n)),
-                      "cudaMalloc prefix");
-  throw_if_cuda_error(cudaMalloc(&old_to_new, sizeof(std::int32_t) * static_cast<std::size_t>(n)),
+  throw_if_cuda_error(stream_ordered_malloc(&old_to_new, sizeof(std::int32_t) * static_cast<std::size_t>(n)),
                       "cudaMalloc old_to_new");
   const std::int32_t count = build_prefix_from_mask(prefix, mask, n);
   constexpr int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   _kernel_old_to_new_from_prefix<<<blocks, threads>>>(old_to_new, mask, prefix, n);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_old_to_new_from_prefix");
-  cudaFree(prefix);
   *count_out = count;
   return old_to_new;
 }
@@ -921,7 +753,7 @@ double* compact_vector(const double* src,
                        std::int32_t n_new) {
   double* dst = nullptr;
   if (n_new > 0) {
-    throw_if_cuda_error(cudaMalloc(&dst, sizeof(double) * static_cast<std::size_t>(n_new)),
+    throw_if_cuda_error(stream_ordered_malloc(&dst, sizeof(double) * static_cast<std::size_t>(n_new)),
                         "cudaMalloc compact vector");
   }
   if (n_old > 0 && n_new > 0) {
@@ -929,18 +761,6 @@ double* compact_vector(const double* src,
     const int blocks = (n_old + threads - 1) / threads;
     _kernel_gather_by_old_to_new<<<blocks, threads>>>(dst, src, old_to_new, n_old);
     throw_if_cuda_error(cudaGetLastError(), "_kernel_gather_by_old_to_new");
-  }
-  return dst;
-}
-
-double* clone_device_vector(const double* src, std::int32_t n, const char* context) {
-  double* dst = nullptr;
-  if (n > 0) {
-    throw_if_cuda_error(cudaMalloc(&dst, sizeof(double) * static_cast<std::size_t>(n)),
-                        context);
-    throw_if_cuda_error(cudaMemcpy(dst, src, sizeof(double) * static_cast<std::size_t>(n),
-                                   cudaMemcpyDeviceToDevice),
-                        context);
   }
   return dst;
 }
@@ -1008,7 +828,7 @@ __global__ void _kernel_removed_fixed_bound_record_counts(std::int32_t* selected
                                                           const double* u,
                                                           double bound_tol,
                                                           std::int32_t n) {
-  const std::int32_t col = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t col = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (col < n) {
     const bool removed = keep_col[col] == std::uint8_t{0};
     const bool fixed = isfinite(l[col]) && isfinite(u[col]) && fabs(l[col] - u[col]) <= bound_tol;
@@ -1024,7 +844,7 @@ __global__ void _kernel_pack_removed_fixed_bound_records(std::int32_t* packed_co
                                                          const double* u,
                                                          double bound_tol,
                                                          std::int32_t n) {
-  const std::int32_t col = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t col = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (col >= n) {
     return;
   }
@@ -1034,7 +854,7 @@ __global__ void _kernel_pack_removed_fixed_bound_records(std::int32_t* packed_co
     return;
   }
   const std::int32_t prev_selected = col == 0 ? 0 : selected_scan[col - 1];
-  const std::int32_t out = selected_scan[col] - 1;
+  const NnzOffset out = selected_scan[col] - 1;
   if (selected_scan[col] == prev_selected || out < 0) {
     return;
   }
@@ -1048,7 +868,7 @@ __global__ void _kernel_gather_removed_bound_values(double* lower_out,
                                                     const double* l,
                                                     const double* u,
                                                     std::int32_t count) {
-  const std::int32_t k = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t k = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (k < count) {
     const std::int32_t col = local_cols[k];
     lower_out[k] = l[col];
@@ -1059,7 +879,7 @@ __global__ void _kernel_gather_removed_bound_values(double* lower_out,
 __global__ void _kernel_removed_col_counts(std::int32_t* selected_scan,
                                            const std::uint8_t* keep_col,
                                            std::int32_t n) {
-  const std::int32_t col = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t col = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (col < n) {
     selected_scan[col] = keep_col[col] == std::uint8_t{0} ? 1 : 0;
   }
@@ -1069,12 +889,12 @@ __global__ void _kernel_pack_removed_cols(std::int32_t* packed_cols,
                                           const std::int32_t* selected_scan,
                                           const std::uint8_t* keep_col,
                                           std::int32_t n) {
-  const std::int32_t col = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t col = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (col >= n || keep_col[col] != std::uint8_t{0}) {
     return;
   }
   const std::int32_t prev_selected = col == 0 ? 0 : selected_scan[col - 1];
-  const std::int32_t out = selected_scan[col] - 1;
+  const NnzOffset out = selected_scan[col] - 1;
   if (selected_scan[col] == prev_selected || out < 0) {
     return;
   }
@@ -1208,23 +1028,41 @@ void append_removed_fixed_bound_records(PresolveRecordGpu& record,
       packed_cols, packed_vals, selected_scan, keep_col, l, u, 1.0e-9, n);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_pack_removed_fixed_bound_records");
 
-  std::vector<std::int32_t> host_cols(static_cast<std::size_t>(count));
-  std::vector<double> host_vals(static_cast<std::size_t>(count));
-  throw_if_cuda_error(cudaMemcpy(host_cols.data(), packed_cols,
-                                 sizeof(std::int32_t) * static_cast<std::size_t>(count),
-                                 cudaMemcpyDeviceToHost),
-                      context);
-  throw_if_cuda_error(cudaMemcpy(host_vals.data(), packed_vals,
-                                 sizeof(double) * static_cast<std::size_t>(count),
-                                 cudaMemcpyDeviceToHost),
-                      context);
-  record.fixed_idx.reserve(record.fixed_idx.size() + static_cast<std::size_t>(count));
-  record.fixed_val.reserve(record.fixed_val.size() + static_cast<std::size_t>(count));
-  for (std::int32_t k = 0; k < count; ++k) {
-    const std::int32_t local_col = host_cols[static_cast<std::size_t>(k)];
-    if (local_col >= 0 && local_col < static_cast<std::int32_t>(old_col_red2org.size())) {
-      record.fixed_idx.push_back(old_col_red2org[static_cast<std::size_t>(local_col)]);
-      record.fixed_val.push_back(host_vals[static_cast<std::size_t>(k)]);
+  if (runtime::options().direct_fixed_values &&
+      old_col_red2org.size() == static_cast<std::size_t>(n)) {
+    const std::size_t index_start = record.fixed_idx.size();
+    const std::size_t value_start = record.fixed_val.size();
+    record.fixed_idx.resize(index_start + count);
+    record.fixed_val.resize(value_start + count);
+    auto* indices = record.fixed_idx.data() + index_start;
+    throw_if_cuda_error(cudaMemcpy(indices, packed_cols, sizeof(std::int32_t) * count,
+                                   cudaMemcpyDeviceToHost), context);
+    throw_if_cuda_error(cudaMemcpy(record.fixed_val.data() + value_start, packed_vals,
+                                   sizeof(double) * count, cudaMemcpyDeviceToHost), context);
+    const auto remap = [&](unsigned, std::size_t begin, std::size_t end) {
+      for (std::size_t k = begin; k < end; ++k) indices[k] = old_col_red2org[indices[k]];
+    };
+    if (count >= (1 << 20)) detail::mapping_parallel_for(count, remap);
+    else remap(0, 0, count);
+  } else {
+    std::vector<std::int32_t> host_cols(static_cast<std::size_t>(count));
+    std::vector<double> host_vals(static_cast<std::size_t>(count));
+    throw_if_cuda_error(cudaMemcpy(host_cols.data(), packed_cols,
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(count),
+                                   cudaMemcpyDeviceToHost),
+                        context);
+    throw_if_cuda_error(cudaMemcpy(host_vals.data(), packed_vals,
+                                   sizeof(double) * static_cast<std::size_t>(count),
+                                   cudaMemcpyDeviceToHost),
+                        context);
+    record.fixed_idx.reserve(record.fixed_idx.size() + static_cast<std::size_t>(count));
+    record.fixed_val.reserve(record.fixed_val.size() + static_cast<std::size_t>(count));
+    for (std::int32_t k = 0; k < count; ++k) {
+      const std::int32_t local_col = host_cols[static_cast<std::size_t>(k)];
+      if (local_col >= 0 && local_col < static_cast<std::int32_t>(old_col_red2org.size())) {
+        record.fixed_idx.push_back(old_col_red2org[static_cast<std::size_t>(local_col)]);
+        record.fixed_val.push_back(host_vals[static_cast<std::size_t>(k)]);
+      }
     }
   }
   cudaFree(selected_scan);
@@ -1252,10 +1090,10 @@ std::vector<std::int32_t> make_identity_i32(std::int32_t n) {
       (static_cast<std::int64_t>(n) + worker_count - 1) / worker_count;
   try {
     for (unsigned worker = 0; worker < worker_count; ++worker) {
-      const std::int32_t begin = static_cast<std::int32_t>(
+      const NnzOffset begin = static_cast<NnzOffset>(
           std::min<std::int64_t>(static_cast<std::int64_t>(n),
                                  static_cast<std::int64_t>(worker) * chunk));
-      const std::int32_t end = static_cast<std::int32_t>(
+      const NnzOffset end = static_cast<NnzOffset>(
           std::min<std::int64_t>(static_cast<std::int64_t>(n),
                                  static_cast<std::int64_t>(worker + 1) * chunk));
       workers.emplace_back([&values, begin, end]() {
@@ -1282,8 +1120,12 @@ PresolveRecordGpu make_initial_record(const LPInfoGpu& lp) {
   record.n0 = lp.A.cols;
   record.m1 = lp.A.rows;
   record.n1 = lp.A.cols;
-  record.row_red2org = make_identity_i32(lp.A.rows);
-  record.col_red2org = make_identity_i32(lp.A.cols);
+  if (device_recovery_enabled())
+    initialize_device_recovery(record);
+  else {
+    record.row_red2org = make_identity_i32(lp.A.rows);
+    record.col_red2org = make_identity_i32(lp.A.cols);
+  }
   record.obj_constant_old = lp.obj_constant;
   record.obj_constant_new = lp.obj_constant;
   return record;
@@ -1301,23 +1143,23 @@ void rebuild_org2red(std::vector<std::int32_t>& org2red,
   }
 }
 
-StructuralL1PrimalRecoveryStep globalize_structural_recovery(
-    const StructuralL1PrimalRecoveryStep& local,
+AbsoluteValueEpigraphPrimalRecoveryStep globalize_absolute_value_epigraph_recovery(
+    const AbsoluteValueEpigraphPrimalRecoveryStep& local,
     const std::vector<std::int32_t>& col_red2org) {
-  StructuralL1PrimalRecoveryStep global = local;
-  for (StructuralL1SplitRecovery& split : global.splits) {
+  AbsoluteValueEpigraphPrimalRecoveryStep global = local;
+  for (AbsoluteValueEpigraphSplitRecovery& split : global.splits) {
     split.t_col = col_red2org[static_cast<std::size_t>(split.t_col)];
     split.e_col = col_red2org[static_cast<std::size_t>(split.e_col)];
   }
-  for (StructuralOuterPairRecovery& pair : global.outer_pairs) {
+  for (AbsoluteValueOuterPairRecovery& pair : global.outer_pairs) {
     pair.bound_col = col_red2org[static_cast<std::size_t>(pair.bound_col)];
     pair.free_col = col_red2org[static_cast<std::size_t>(pair.free_col)];
   }
-  for (StructuralLinkedSlackRecovery& slack : global.linked_slacks) {
+  for (AbsoluteValueLinkedSlackRecovery& slack : global.linked_slacks) {
     slack.slack_col = col_red2org[static_cast<std::size_t>(slack.slack_col)];
     slack.t_col = col_red2org[static_cast<std::size_t>(slack.t_col)];
   }
-  for (StructuralMaxSlackRecovery& slack : global.max_slacks) {
+  for (AbsoluteValueMaxSlackRecovery& slack : global.max_slacks) {
     slack.slack_col = col_red2org[static_cast<std::size_t>(slack.slack_col)];
     for (std::int32_t& t_col : slack.t_cols) {
       t_col = col_red2org[static_cast<std::size_t>(t_col)];
@@ -1326,10 +1168,10 @@ StructuralL1PrimalRecoveryStep globalize_structural_recovery(
   return global;
 }
 
-AntipodalComponentPrimalRecoveryStep globalize_antipodal_recovery(
-    const AntipodalComponentPrimalRecoveryStep& local,
+VariablePairAggregationRecoveryStep globalize_variable_pair_aggregation_recovery(
+    const VariablePairAggregationRecoveryStep& local,
     const std::vector<std::int32_t>& col_red2org) {
-  AntipodalComponentPrimalRecoveryStep global = local;
+  VariablePairAggregationRecoveryStep global = local;
   const std::size_t count = global.plus_cols.size();
   for (std::size_t i = 0; i < count; ++i) {
     global.plus_cols[i] =
@@ -1360,51 +1202,32 @@ std::int32_t map_local_row_to_global(std::int32_t row,
   return row_red2org[static_cast<std::size_t>(row)];
 }
 
-void append_globalized_postsolve_tape(PostsolveTape& dest,
-                                      const PostsolveTape& src,
-                                      const std::vector<std::int32_t>& row_red2org,
-                                      const std::vector<std::int32_t>& col_red2org) {
-  if (src.types.empty()) {
-    return;
+// Opt-in diagnostic timings. No synchronization or output when disabled.
+class DetailStageTimer {
+ public:
+  explicit DetailStageTimer(const char* section) : section_(section),
+      enabled_(runtime::options().profile_details) {
+    if (enabled_) last_ = std::chrono::steady_clock::now();
   }
-  const std::size_t old_records = dest.types.size();
-  const std::size_t old_indices = dest.indices.size();
-  const std::size_t old_values = dest.vals.size();
-  const auto reserve_for_append = [](auto& values, std::size_t added) {
-    const std::size_t required = values.size() + added;
-    if (required <= values.capacity()) {
-      return;
-    }
-    const std::size_t doubled = values.capacity() <=
-            std::numeric_limits<std::size_t>::max() / 2
-        ? values.capacity() * 2
-        : std::numeric_limits<std::size_t>::max();
-    values.reserve(std::max(required, doubled));
-  };
-  reserve_for_append(dest.types, src.types.size());
-  reserve_for_append(dest.index_starts, src.types.size());
-  reserve_for_append(dest.value_starts, src.types.size());
-  reserve_for_append(dest.dual_modes, src.dual_modes.size());
-  reserve_for_append(dest.indices, src.indices.size());
-  reserve_for_append(dest.vals, src.vals.size());
-
-  // Append each flat array once while preserving chronological record order.
-  // This avoids repeated small insertions for singleton-heavy models.
-  dest.types.insert(dest.types.end(), src.types.begin(), src.types.end());
-  dest.dual_modes.insert(dest.dual_modes.end(),
-                         src.dual_modes.begin(), src.dual_modes.end());
-  dest.indices.insert(dest.indices.end(), src.indices.begin(), src.indices.end());
-  dest.vals.insert(dest.vals.end(), src.vals.begin(), src.vals.end());
-
-  dest.index_starts.resize(old_records + src.types.size() + 1);
-  dest.value_starts.resize(old_records + src.types.size() + 1);
-  for (std::size_t k = 1; k <= src.types.size(); ++k) {
-    dest.index_starts[old_records + k] = static_cast<std::int32_t>(
-        old_indices + static_cast<std::size_t>(src.index_starts[k]));
-    dest.value_starts[old_records + k] = static_cast<std::int32_t>(
-        old_values + static_cast<std::size_t>(src.value_starts[k]));
+  void mark(const char* stage, bool synchronize = false) {
+    if (!enabled_) return;
+    if (synchronize) throw_if_cuda_error(cudaDeviceSynchronize(), "detail profile synchronize");
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_).count();
+    std::cerr << ">>> [GPU Presolve C++ detail-profile] section=" << section_
+              << " stage=" << stage << " time=" << seconds << "s\n";
+    last_ = std::chrono::steady_clock::now();
   }
+ private:
+  const char* section_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point last_;
+};
 
+void remap_postsolve_tape_indices(PostsolveTape& dest, const PostsolveTape& src,
+                                  std::size_t old_indices,
+                                  const std::vector<std::int32_t>& row_red2org,
+                                  const std::vector<std::int32_t>& col_red2org) {
   struct IndexSegment {
     std::vector<std::int32_t>& values;
     std::size_t offset;
@@ -1415,9 +1238,10 @@ void append_globalized_postsolve_tape(PostsolveTape& dest,
     std::int32_t& operator[](std::size_t index) { return values[offset + index]; }
   };
 
-  for (std::int32_t k = 0; k < static_cast<std::int32_t>(src.types.size()); ++k) {
-    const std::int32_t idx0 = src.index_starts[static_cast<std::size_t>(k)];
-    const std::int32_t idx1 = src.index_starts[static_cast<std::size_t>(k + 1)];
+  const auto remap_range = [&](NnzOffset begin, NnzOffset end) {
+  for (std::int32_t k = begin; k < end; ++k) {
+    const NnzOffset idx0 = src.index_starts[static_cast<std::size_t>(k)];
+    const NnzOffset idx1 = src.index_starts[static_cast<std::size_t>(k + 1)];
     const std::size_t index_offset =
         old_indices + static_cast<std::size_t>(idx0);
     IndexSegment indices{dest.indices, index_offset,
@@ -1437,7 +1261,7 @@ void append_globalized_postsolve_tape(PostsolveTape& dest,
           indices[1] = map_local_col_to_global(indices[1], col_red2org);
           std::size_t p = 2;
           while (p < indices.size()) {
-            const std::int32_t row_len = indices[p++];
+            const NnzOffset row_len = indices[p++];
             for (std::int32_t t = 0; t < row_len && p < indices.size(); ++t, ++p) {
               indices[p] = map_local_col_to_global(indices[p], col_red2org);
             }
@@ -1455,13 +1279,13 @@ void append_globalized_postsolve_tape(PostsolveTape& dest,
           }
         }
         break;
-      case PostsolveReductionType::DuplicateColumn:
+      case PostsolveReductionType::ParallelColumn:
         if (indices.size() >= 2) {
           indices[0] = map_local_col_to_global(indices[0], col_red2org);
           indices[1] = map_local_col_to_global(indices[1], col_red2org);
         }
         break;
-      case PostsolveReductionType::DuplicateRow:
+      case PostsolveReductionType::ParallelRow:
         if (indices.size() >= 2) {
           indices[0] = map_local_row_to_global(indices[0], row_red2org);
           indices[1] = map_local_row_to_global(indices[1], row_red2org);
@@ -1530,16 +1354,161 @@ void append_globalized_postsolve_tape(PostsolveTape& dest,
     }
 
   }
+  };
+  // Only disjoint index segments are written. Record order and all floating
+  // values remain untouched; maps and source offsets are read-only.
+  const auto count = static_cast<NnzOffset>(src.types.size());
+  const unsigned workers_count = runtime::options().parallel_tape_build &&
+          src.indices.size() >= (1U << 20) && count >= 1024
+      ? std::min(8U, std::max(1U, std::thread::hardware_concurrency())) : 1U;
+  if (workers_count == 1) {
+    remap_range(0, count);
+  } else {
+    std::vector<std::thread> workers;
+    workers.reserve(workers_count - 1);
+    const auto boundary = [&](unsigned i) {
+      return static_cast<std::int32_t>(static_cast<std::int64_t>(count) * i / workers_count);
+    };
+    try {
+      for (unsigned i = 1; i < workers_count; ++i) {
+        workers.emplace_back(remap_range, boundary(i), boundary(i + 1));
+      }
+      remap_range(0, boundary(1));
+    } catch (...) {
+      for (auto& worker : workers) worker.join();
+      throw;
+    }
+    for (auto& worker : workers) worker.join();
+  }
+
 }
 
-void update_record_from_plan(PresolveRecordGpu& record,
-                             const PresolvePlanGpu& plan,
-                             const LPInfoGpu& old_lp,
-                             std::int32_t m_new,
-                             std::int32_t n_new,
-                             double obj_constant_new,
-                             const std::int32_t* col_old_to_new) {
-  const bool profile_record = env_enabled("GPUPRESOLVER_PRESOLVE_RECORD_PROFILE");
+void append_globalized_postsolve_tape(PostsolveTape& dest,
+                                      const PostsolveTape& src,
+                                      const std::vector<std::int32_t>& row_red2org,
+                                      const std::vector<std::int32_t>& col_red2org) {
+  if (src.types.empty()) {
+    return;
+  }
+  DetailStageTimer detail("tape");
+  const std::size_t old_records = dest.types.size();
+  const std::size_t old_indices = dest.indices.size();
+  const std::size_t old_values = dest.vals.size();
+  const bool tape_headroom = runtime::options().reserve_tape_headroom;
+  const auto reserve_for_append = [tape_headroom](auto& values, std::size_t added) {
+    const std::size_t required = values.size() + added;
+    if (required <= values.capacity()) {
+      return;
+    }
+    const std::size_t doubled = values.capacity() <=
+            std::numeric_limits<std::size_t>::max() / 2
+        ? values.capacity() * 2
+        : std::numeric_limits<std::size_t>::max();
+    // A large first append otherwise fills capacity exactly and the following
+    // tiny append copies the entire history. Reserve bounded, untouched slack.
+    const std::size_t extra = tape_headroom && required >= (1U << 20) / sizeof(values[0])
+        ? std::min(required / 4, (64U << 20) / sizeof(values[0])) : 0;
+    values.reserve(std::max(required + extra, doubled));
+  };
+  reserve_for_append(dest.types, src.types.size());
+  reserve_for_append(dest.index_starts, src.types.size());
+  reserve_for_append(dest.value_starts, src.types.size());
+  reserve_for_append(dest.dual_modes, src.dual_modes.size());
+  reserve_for_append(dest.indices, src.indices.size());
+  reserve_for_append(dest.vals, src.vals.size());
+
+  detail.mark("reserve");
+
+  // Preserve the exact chronological representation, but append each flat
+  // array only once.  The previous per-record vector::insert calls repeated
+  // millions of tiny range operations for singleton-heavy models.
+  dest.types.insert(dest.types.end(), src.types.begin(), src.types.end());
+  dest.dual_modes.insert(dest.dual_modes.end(),
+                         src.dual_modes.begin(), src.dual_modes.end());
+  dest.indices.insert(dest.indices.end(), src.indices.begin(), src.indices.end());
+  dest.vals.insert(dest.vals.end(), src.vals.begin(), src.vals.end());
+
+  detail.mark("append_arrays");
+
+  dest.index_starts.resize(old_records + src.types.size() + 1);
+  dest.value_starts.resize(old_records + src.types.size() + 1);
+  for (std::size_t k = 1; k <= src.types.size(); ++k) {
+    dest.index_starts[old_records + k] = static_cast<NnzOffset>(
+        old_indices + static_cast<std::size_t>(src.index_starts[k]));
+    dest.value_starts[old_records + k] = static_cast<NnzOffset>(
+        old_values + static_cast<std::size_t>(src.value_starts[k]));
+  }
+
+  detail.mark("offsets");
+
+  remap_postsolve_tape_indices(dest, src, old_indices, row_red2org, col_red2org);
+  detail.mark("remap");
+}
+
+// Private to a single presolve invocation. Rule order and recovery checkpoints
+// use cumulative record counts; public records are flattened before return.
+struct HostTapeChunks {
+  bool enabled = runtime::options().chunked_tape;
+  std::size_t records = 0, indices = 0, values = 0;
+  std::vector<PostsolveTape> segments;
+
+  void append(PostsolveTape& source,
+              const std::vector<std::int32_t>& rows,
+              const std::vector<std::int32_t>& cols) {
+    if (source.types.empty()) return;
+    if (source.types.size() > INT64_MAX - records ||
+        source.indices.size() > INT64_MAX - indices ||
+        source.vals.size() > INT64_MAX - values)
+      throw std::runtime_error("chunked postsolve tape exceeds 32-bit range");
+    // The source starts and types remain read-only while disjoint index
+    // segments are globalized in place, before moving ownership from the plan.
+    remap_postsolve_tape_indices(source, source, 0, rows, cols);
+    records += source.types.size();indices += source.indices.size();values += source.vals.size();
+    segments.push_back(std::move(source));
+    source = PostsolveTape{};
+  }
+
+  void finish(PostsolveTape& dest) {
+    if (!enabled || segments.empty()) return;
+    DetailStageTimer timer("tape_chunks");
+    dest = std::move(segments.front());
+    // One allocation per final array; no repeated movement of historical data.
+    dest.types.reserve(records);dest.dual_modes.reserve(records);
+    dest.index_starts.reserve(records+1);dest.value_starts.reserve(records+1);
+    dest.indices.reserve(indices);dest.vals.reserve(values);
+    for (std::size_t q=1; q<segments.size(); ++q) {
+      auto& src=segments[q];
+      const auto old_records=dest.types.size();
+      const auto old_indices=dest.indices.size(), old_values=dest.vals.size();
+      dest.types.insert(dest.types.end(),src.types.begin(),src.types.end());
+      dest.dual_modes.insert(dest.dual_modes.end(),src.dual_modes.begin(),src.dual_modes.end());
+      dest.indices.insert(dest.indices.end(),src.indices.begin(),src.indices.end());
+      dest.vals.insert(dest.vals.end(),src.vals.begin(),src.vals.end());
+      dest.index_starts.resize(old_records+src.types.size()+1);
+      dest.value_starts.resize(old_records+src.types.size()+1);
+      for(std::size_t k=1;k<=src.types.size();++k) {
+        dest.index_starts[old_records+k]=static_cast<NnzOffset>(old_indices+src.index_starts[k]);
+        dest.value_starts[old_records+k]=static_cast<NnzOffset>(old_values+src.value_starts[k]);
+      }
+      src=PostsolveTape{};
+    }
+    segments.clear();
+    timer.mark("flatten");
+  }
+};
+
+void update_record_from_plan(PresolveRecordGpu &record, PresolvePlanGpu &plan,
+                             const LPInfoGpu &old_lp, std::int32_t m_new, std::int32_t n_new,
+                             double obj_constant_new, const std::int32_t *row_old_to_new,
+                             const std::int32_t *col_old_to_new, HostTapeChunks &tape_chunks) {
+  if (record.device) {
+    update_device_recovery(record, plan, old_lp, m_new, n_new, obj_constant_new, row_old_to_new,
+                           col_old_to_new);
+    return;
+  }
+  const auto source_records=plan.tape.types.size(), source_indices=plan.tape.indices.size(), source_values=plan.tape.vals.size();
+  DetailStageTimer detail("mapping");
+  const bool profile_record = runtime::options().profile_records;
   const auto record_start = std::chrono::steady_clock::now();
   const bool has_removed_rows = m_new < old_lp.A.rows;
   const bool has_removed_cols = n_new < old_lp.A.cols;
@@ -1549,7 +1518,7 @@ void update_record_from_plan(PresolveRecordGpu& record,
       has_removed_rows && removed_row_count <= SPARSE_FIXED_BOUND_RECORD_THRESHOLD;
   const bool sparse_col_update =
       has_removed_cols && removed_col_count <= SPARSE_FIXED_BOUND_RECORD_THRESHOLD;
-  const bool record_removed_indices = env_enabled("GPUPRESOLVER_RECORD_REMOVED_INDICES");
+  const bool record_removed_indices = runtime::options().record_removed_indices;
   const bool identity_gpu_col_update =
       has_removed_cols && n_new > 0 && old_lp.A.cols >= 1000000 &&
       removed_col_count >= old_lp.A.cols / 8 &&
@@ -1593,13 +1562,14 @@ void update_record_from_plan(PresolveRecordGpu& record,
     }
   }
 
+  detail.mark("keep_copy_and_reserve");
   if (has_removed_rows) {
     if (sparse_row_update) {
       removed_local_rows = pack_removed_cols_sparse(plan.keep_row_mask,
                                                     old_lp.A.rows,
                                                     removed_row_count,
                                                     "cudaMemcpy sparse removed rows");
-      std::int32_t range_begin = 0;
+      NnzOffset range_begin = 0;
       for (const std::int32_t local_row : removed_local_rows) {
         if (local_row < range_begin ||
             local_row >= static_cast<std::int32_t>(old_row_red2org.size())) {
@@ -1617,11 +1587,14 @@ void update_record_from_plan(PresolveRecordGpu& record,
       next_row_red2org.insert(next_row_red2org.end(),
                               old_row_red2org.begin() + range_begin,
                               old_row_red2org.end());
+    } else if (runtime::options().parallel_mapping && old_row_red2org.size() >= (1U << 20)) {
+      detail::compact_mapping_stable(old_row_red2org, keep_row, m_new, next_row_red2org,
+          record_removed_indices ? &record.removed_row_idx : nullptr);
     } else {
       next_row_red2org.resize(static_cast<std::size_t>(m_new));
       std::size_t next_row = 0;
       for (std::int32_t row = 0; row < old_lp.A.rows; ++row) {
-        const std::int32_t global =
+        const NnzOffset global =
             old_row_red2org[static_cast<std::size_t>(row)];
         if (keep_row[static_cast<std::size_t>(row)] != std::uint8_t{0}) {
           next_row_red2org[next_row++] = global;
@@ -1636,6 +1609,7 @@ void update_record_from_plan(PresolveRecordGpu& record,
       }
     }
   }
+  detail.mark("row_mapping");
   if (has_removed_cols) {
     if (identity_gpu_col_update) {
       next_col_red2org = compact_identity_red2org_on_gpu(
@@ -1649,7 +1623,7 @@ void update_record_from_plan(PresolveRecordGpu& record,
                                                     old_lp.A.cols,
                                                     removed_col_count,
                                                     "cudaMemcpy sparse removed cols");
-      std::int32_t range_begin = 0;
+      NnzOffset range_begin = 0;
       for (const std::int32_t local_col : removed_local_cols) {
         if (local_col < range_begin ||
             local_col >= static_cast<std::int32_t>(old_col_red2org.size())) {
@@ -1666,11 +1640,14 @@ void update_record_from_plan(PresolveRecordGpu& record,
       next_col_red2org.insert(next_col_red2org.end(),
                               old_col_red2org.begin() + range_begin,
                               old_col_red2org.end());
+    } else if (runtime::options().parallel_mapping && old_col_red2org.size() >= (1U << 20)) {
+      detail::compact_mapping_stable(old_col_red2org, keep_col, n_new, next_col_red2org,
+          record_removed_indices ? &record.removed_col_idx : nullptr);
     } else {
       next_col_red2org.resize(static_cast<std::size_t>(n_new));
       std::size_t next_col = 0;
       for (std::int32_t col = 0; col < old_lp.A.cols; ++col) {
-        const std::int32_t global =
+        const NnzOffset global =
             old_col_red2org[static_cast<std::size_t>(col)];
         if (keep_col[static_cast<std::size_t>(col)] != std::uint8_t{0}) {
           next_col_red2org[next_col++] = global;
@@ -1684,7 +1661,9 @@ void update_record_from_plan(PresolveRecordGpu& record,
         throw std::runtime_error("column mapping compaction count mismatch");
       }
     }
-    if (identity_gpu_col_update && identity_removed_fixed_count == 0) {
+    detail.mark("col_mapping");
+    if (plan.cleanup_recovery_captured ||
+        (identity_gpu_col_update && identity_removed_fixed_count == 0)) {
       // The identity compaction kernel already checked every removed column.
       // A nonzero count falls through to the original stable packing path.
     } else if (sparse_col_update) {
@@ -1704,13 +1683,14 @@ void update_record_from_plan(PresolveRecordGpu& record,
                                          "cudaMemcpy record fixed bounds");
     }
   }
+  detail.mark("fixed_records");
   const auto after_removed_mapping = std::chrono::steady_clock::now();
 
   const bool has_primal_recovery =
-      plan.has_structural_primal_recovery ||
-      plan.has_antipodal_component_recovery;
-  if (plan.has_structural_primal_recovery &&
-      plan.has_antipodal_component_recovery) {
+      plan.has_absolute_value_epigraph_recovery ||
+      plan.has_variable_pair_aggregation_recovery;
+  if (plan.has_absolute_value_epigraph_recovery &&
+      plan.has_variable_pair_aggregation_recovery) {
     throw std::runtime_error(
         "a presolve plan cannot commit structural and antipodal primal "
         "recoveries at the same chronological position");
@@ -1720,51 +1700,56 @@ void update_record_from_plan(PresolveRecordGpu& record,
         "a primal-recovery plan must not also contain ordinary postsolve "
         "records; split it into chronological plans");
   }
-  if (record.tape.types.size() > static_cast<std::size_t>(INT32_MAX)) {
+  const auto tape_size=tape_chunks.enabled?tape_chunks.records:record.tape.types.size();
+  if (tape_size > static_cast<std::size_t>(INT64_MAX)) {
     throw std::runtime_error("postsolve tape exceeds 32-bit checkpoint range");
   }
-  const std::int32_t tape_position =
-      static_cast<std::int32_t>(record.tape.types.size());
-  if (plan.has_structural_primal_recovery) {
-    if (record.structural_primal_recoveries.size() >=
-        static_cast<std::size_t>(INT32_MAX)) {
+  const NnzOffset tape_position =
+      static_cast<NnzOffset>(tape_size);
+  if (plan.has_absolute_value_epigraph_recovery) {
+    if (record.absolute_value_epigraph_recoveries.size() >=
+        static_cast<std::size_t>(INT64_MAX)) {
       throw std::runtime_error(
           "structural recovery payload exceeds 32-bit checkpoint range");
     }
-    const std::int32_t payload_index = static_cast<std::int32_t>(
-        record.structural_primal_recoveries.size());
-    record.structural_primal_recoveries.push_back(
-        globalize_structural_recovery(plan.structural_primal_recovery,
+    const NnzOffset payload_index = static_cast<NnzOffset>(
+        record.absolute_value_epigraph_recoveries.size());
+    record.absolute_value_epigraph_recoveries.push_back(
+        globalize_absolute_value_epigraph_recovery(plan.absolute_value_epigraph_recovery,
                                       old_col_red2org));
     record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-        PrimalRecoveryKind::StructuralL1, payload_index, tape_position});
+        PrimalRecoveryKind::AbsoluteValueEpigraph, payload_index, tape_position});
   }
-  if (plan.has_antipodal_component_recovery) {
-    if (record.antipodal_component_recoveries.size() >=
-        static_cast<std::size_t>(INT32_MAX)) {
+  if (plan.has_variable_pair_aggregation_recovery) {
+    if (record.variable_pair_aggregation_recoveries.size() >=
+        static_cast<std::size_t>(INT64_MAX)) {
       throw std::runtime_error(
           "antipodal recovery payload exceeds 32-bit checkpoint range");
     }
-    const std::int32_t payload_index = static_cast<std::int32_t>(
-        record.antipodal_component_recoveries.size());
-    record.antipodal_component_recoveries.push_back(
-        globalize_antipodal_recovery(plan.antipodal_component_recovery,
+    const NnzOffset payload_index = static_cast<NnzOffset>(
+        record.variable_pair_aggregation_recoveries.size());
+    record.variable_pair_aggregation_recoveries.push_back(
+        globalize_variable_pair_aggregation_recovery(plan.variable_pair_aggregation_recovery,
                                      old_col_red2org));
     record.primal_recovery_timeline.push_back(PrimalRecoveryCheckpoint{
-        PrimalRecoveryKind::AntipodalComponent, payload_index,
+        PrimalRecoveryKind::VariablePairAggregation, payload_index,
         tape_position});
-    record.has_primal_only_antipodal_reduction = true;
+    record.has_primal_only_variable_pair_aggregation_reduction = true;
   }
-  if (plan.has_covering_cost_dominance_reduction) {
-    record.has_primal_only_covering_cost_dominance_reduction = true;
+  if (plan.has_column_domination_reduction) {
+    record.has_primal_only_column_domination_reduction = true;
   }
   if (plan.has_projected_auxiliary_reduction) {
     record.has_primal_only_projected_auxiliary_reduction = true;
   }
-  append_globalized_postsolve_tape(record.tape, plan.tape,
-                                   old_row_red2org, old_col_red2org);
-  // Append to the canonical host tape during presolve.  Upload it lazily
-  // in postsolve_gpu to avoid repeatedly growing and copying a device mirror.
+  if (tape_chunks.enabled) tape_chunks.append(plan.tape, old_row_red2org, old_col_red2org);
+  else append_globalized_postsolve_tape(record.tape, plan.tape, old_row_red2org, old_col_red2org);
+  // Keep the canonical tape append-only on the host during presolve.  Growing
+  // one contiguous device mirror after every rule copies the entire tape each
+  // time a capacity boundary is crossed; on large models that turns a tiny
+  // final append into hundreds of milliseconds of historical D2D copies.
+  // The complete device tape is materialized once, in canonical order, after
+  // the last presolve rule has committed.
   const auto after_tape = std::chrono::steady_clock::now();
 
   if (has_removed_rows) {
@@ -1789,9 +1774,9 @@ void update_record_from_plan(PresolveRecordGpu& record,
               << m_new << "," << n_new << ")"
               << " removed_rows=" << (old_lp.A.rows - m_new)
               << " removed_cols=" << (old_lp.A.cols - n_new)
-              << " tape_records=" << plan.tape.types.size()
-              << " tape_indices=" << plan.tape.indices.size()
-              << " tape_vals=" << plan.tape.vals.size()
+              << " tape_records=" << source_records
+              << " tape_indices=" << source_indices
+              << " tape_vals=" << source_values
               << " keep_copy=" << keep_copy_elapsed.count() << "s"
               << " old_mapping_copy=" << old_mapping_copy_elapsed.count() << "s"
               << " removed_mapping=" << removed_mapping_elapsed.count() << "s"
@@ -1802,80 +1787,7 @@ void update_record_from_plan(PresolveRecordGpu& record,
 }
 
 DeviceCsrMatrix transpose_csr_gpu(const DeviceCsrMatrix& A) {
-  DeviceCsrMatrix AT;
-  AT.rows = A.cols;
-  AT.cols = A.rows;
-  AT.nnz = A.nnz;
-  cusparseHandle_t handle = nullptr;
-  void* buffer = nullptr;
-  try {
-    throw_if_cuda_error(cudaMalloc(&AT.rowPtr, sizeof(std::int32_t) * static_cast<std::size_t>(AT.rows + 1)),
-                        "cudaMalloc transpose rowPtr");
-    if (A.nnz == 0) {
-      throw_if_cuda_error(cudaMemset(AT.rowPtr, 0, sizeof(std::int32_t) * static_cast<std::size_t>(AT.rows + 1)),
-                          "cudaMemset empty transpose rowPtr");
-      return AT;
-    }
-    throw_if_cuda_error(cudaMalloc(&AT.colVal, sizeof(std::int32_t) * static_cast<std::size_t>(A.nnz)),
-                        "cudaMalloc transpose colVal");
-    throw_if_cuda_error(cudaMalloc(&AT.nzVal, sizeof(double) * static_cast<std::size_t>(A.nnz)),
-                        "cudaMalloc transpose nzVal");
-
-    throw_if_cusparse_error(cusparseCreate(&handle), "cusparseCreate transpose");
-    std::size_t buffer_size = 0;
-    constexpr cusparseCsr2CscAlg_t alg = CUSPARSE_CSR2CSC_ALG1;
-    throw_if_cusparse_error(
-        cusparseCsr2cscEx2_bufferSize(handle,
-                                       A.rows,
-                                       A.cols,
-                                       A.nnz,
-                                       A.nzVal,
-                                       A.rowPtr,
-                                       A.colVal,
-                                       AT.nzVal,
-                                       AT.rowPtr,
-                                       AT.colVal,
-                                       CUDA_R_64F,
-                                       CUSPARSE_ACTION_NUMERIC,
-                                       CUSPARSE_INDEX_BASE_ZERO,
-                                       alg,
-                                       &buffer_size),
-        "cusparseCsr2cscEx2_bufferSize transpose");
-    if (buffer_size > 0) {
-      throw_if_cuda_error(cudaMalloc(&buffer, buffer_size),
-                          "cudaMalloc cusparse transpose buffer");
-    }
-    throw_if_cusparse_error(cusparseCsr2cscEx2(handle,
-                                              A.rows,
-                                              A.cols,
-                                              A.nnz,
-                                              A.nzVal,
-                                              A.rowPtr,
-                                              A.colVal,
-                                              AT.nzVal,
-                                              AT.rowPtr,
-                                              AT.colVal,
-                                              CUDA_R_64F,
-                                              CUSPARSE_ACTION_NUMERIC,
-                                              CUSPARSE_INDEX_BASE_ZERO,
-                                              alg,
-                                              buffer),
-                           "cusparseCsr2cscEx2 transpose");
-    cudaFree(buffer);
-    buffer = nullptr;
-    throw_if_cusparse_error(cusparseDestroy(handle), "cusparseDestroy transpose");
-    handle = nullptr;
-    return AT;
-  } catch (...) {
-    cudaFree(buffer);
-    if (handle != nullptr) {
-      cusparseDestroy(handle);
-    }
-    cudaFree(AT.rowPtr);
-    cudaFree(AT.colVal);
-    cudaFree(AT.nzVal);
-    throw;
-  }
+  return gpu_presolver::presolve::transpose_csr64(A);
 }
 
 DeviceCsrMatrix compact_csr_by_masks_gpu(const DeviceCsrMatrix& A,
@@ -1883,39 +1795,52 @@ DeviceCsrMatrix compact_csr_by_masks_gpu(const DeviceCsrMatrix& A,
                                          const std::int32_t* col_old_to_new,
                                          std::int32_t m_new,
                                          std::int32_t n_new) {
+  DetailStageTimer detail("compact");
   DeviceCsrMatrix out;
   out.rows = m_new;
   out.cols = n_new;
-  throw_if_cuda_error(stream_ordered_malloc(&out.rowPtr, sizeof(std::int32_t) * static_cast<std::size_t>(m_new + 1)),
+  throw_if_cuda_error(stream_ordered_malloc(&out.rowPtr, sizeof(NnzOffset) * static_cast<std::size_t>(m_new + 1)),
                       "cudaMalloc compact rowPtr");
   if (m_new == 0 || n_new == 0) {
-    throw_if_cuda_error(cudaMemset(out.rowPtr, 0, sizeof(std::int32_t) * static_cast<std::size_t>(m_new + 1)),
+    throw_if_cuda_error(cudaMemset(out.rowPtr, 0, sizeof(NnzOffset) * static_cast<std::size_t>(m_new + 1)),
                         "cudaMemset empty compact rowPtr");
     return out;
   }
-  std::int32_t* row_counts = nullptr;
+  NnzOffset* row_counts = nullptr;
   std::int32_t* long_rows = nullptr;
+  std::int32_t* medium_rows = nullptr;
   std::int32_t* long_row_count = nullptr;
-  // Reserve full 256-thread blocks for dense rows to avoid excessive thread
-  // allocation on matrices with many short rows.
+  // A full 256-thread block per row only pays off for genuinely dense rows.
+  // A low threshold oversubscribes models such as dlr2 (millions of rows with
+  // only 11--15 entries each), while s82's roughly 80 entries per row still
+  // benefits from the cooperative path.
   const bool use_block_per_row =
       static_cast<std::int64_t>(A.nnz) >
       32LL * static_cast<std::int64_t>(A.rows);
-  const bool use_long_row_kernels = !use_block_per_row && A.nnz >= 10000000;
+  const bool compact_warp = !use_block_per_row && A.rows >= 4096 &&
+      A.nnz >= 65536 && runtime::options().warp_compaction;
+  const std::int32_t medium_threshold = compact_warp ? 8 : INT_MAX;
+  const bool compact_long = runtime::options().long_row_compaction;
+  // A matrix below 10M nnz can still contain extremely long rows. Keep the
+  // same per-row threshold, but do not gate long-row work on total nnz.
+  const bool use_long_row_kernels = !use_block_per_row &&
+      (compact_warp || compact_long || A.nnz >= 10000000);
   const std::int32_t long_row_threshold =
       use_long_row_kernels ? COMPACT_LONG_ROW_THRESHOLD : INT_MAX;
-  throw_if_cuda_error(stream_ordered_malloc(&row_counts, sizeof(std::int32_t) * static_cast<std::size_t>(m_new)),
+  throw_if_cuda_error(stream_ordered_malloc(&row_counts, sizeof(NnzOffset) * static_cast<std::size_t>(m_new)),
                       "cudaMalloc compact row_counts");
-  throw_if_cuda_error(cudaMemset(row_counts, 0, sizeof(std::int32_t) * static_cast<std::size_t>(m_new)),
+  throw_if_cuda_error(cudaMemset(row_counts, 0, sizeof(NnzOffset) * static_cast<std::size_t>(m_new)),
                       "cudaMemset compact row_counts");
   if (use_long_row_kernels) {
     throw_if_cuda_error(stream_ordered_malloc(&long_rows, sizeof(std::int32_t) * static_cast<std::size_t>(A.rows)),
                         "cudaMalloc compact long_rows");
-    throw_if_cuda_error(stream_ordered_malloc(&long_row_count, sizeof(std::int32_t)),
+    throw_if_cuda_error(stream_ordered_malloc(&long_row_count, sizeof(std::int32_t) * (compact_warp ? 2 : 1)),
                         "cudaMalloc compact long_row_count");
-    throw_if_cuda_error(cudaMemset(long_row_count, 0, sizeof(std::int32_t)),
+    throw_if_cuda_error(cudaMemset(long_row_count, 0, sizeof(std::int32_t) * (compact_warp ? 2 : 1)),
                         "cudaMemset compact long_row_count");
   }
+  if (compact_warp) medium_rows = long_rows;
+  detail.mark("allocation", true);
   constexpr int threads = 256;
   const int old_row_blocks = (A.rows + threads - 1) / threads;
   if (use_block_per_row) {
@@ -1925,34 +1850,46 @@ DeviceCsrMatrix compact_csr_by_masks_gpu(const DeviceCsrMatrix& A,
   } else {
     _kernel_count_compacted_rows<<<old_row_blocks, threads>>>(
         row_counts, row_old_to_new, col_old_to_new, A.rowPtr, A.colVal,
-        long_rows, long_row_count, long_row_threshold, A.rows);
+        long_rows, long_row_count, long_row_threshold, A.rows,
+        medium_rows, compact_warp ? long_row_count + 1 : nullptr, medium_threshold);
     throw_if_cuda_error(cudaGetLastError(), "_kernel_count_compacted_rows");
   }
-  std::int32_t long_row_count_host = 0;
+  std::int32_t queue_counts[2] = {0, 0};
   if (use_long_row_kernels) {
-    throw_if_cuda_error(cudaMemcpy(&long_row_count_host, long_row_count,
-                                   sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+    throw_if_cuda_error(cudaMemcpy(queue_counts, long_row_count,
+                                   sizeof(std::int32_t) * (compact_warp ? 2 : 1), cudaMemcpyDeviceToHost),
                         "cudaMemcpy compact long_row_count");
+  }
+  const auto long_row_count_host = queue_counts[0];
+  const auto medium_count = queue_counts[1];
+  if (medium_count > 0) {
+    _kernel_compact_medium_rows<<<(medium_count + 7) / 8, threads>>>(
+        row_counts, nullptr, nullptr, nullptr, row_old_to_new, col_old_to_new,
+        A.rowPtr, A.colVal, A.nzVal, medium_rows, medium_count);
+    throw_if_cuda_error(cudaGetLastError(), "count compact medium_rows");
   }
   if (long_row_count_host > 0) {
     _kernel_count_compacted_long_rows<<<long_row_count_host, threads>>>(
         row_counts, row_old_to_new, col_old_to_new, A.rowPtr, A.colVal,
-        long_rows, long_row_count_host);
+        long_rows + (compact_warp ? A.rows - long_row_count_host : 0), long_row_count_host);
     throw_if_cuda_error(cudaGetLastError(), "_kernel_count_compacted_long_rows");
   }
+  detail.mark("count_rows", true);
   inclusive_scan_i32(row_counts, m_new, "cub inclusive scan compact");
-  std::int32_t nnz_new = 0;
-  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts + m_new - 1, sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+  NnzOffset nnz_new = 0;
+  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts + m_new - 1, sizeof(NnzOffset), cudaMemcpyDeviceToHost),
                       "cudaMemcpy compact nnz");
   out.nnz = nnz_new;
   const int new_row_blocks = (m_new + threads - 1) / threads;
   _kernel_row_ptr_from_prefix<<<new_row_blocks, threads>>>(out.rowPtr, row_counts, m_new);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_row_ptr_from_prefix compact");
+  detail.mark("scan_and_nnz", true);
   if (nnz_new > 0) {
     throw_if_cuda_error(stream_ordered_malloc(&out.colVal, sizeof(std::int32_t) * static_cast<std::size_t>(nnz_new)),
                         "cudaMalloc compact colVal");
     throw_if_cuda_error(stream_ordered_malloc(&out.nzVal, sizeof(double) * static_cast<std::size_t>(nnz_new)),
                         "cudaMalloc compact nzVal");
+    detail.mark("allocate_output", true);
     if (use_block_per_row) {
       _kernel_copy_compacted_rows_block<<<A.rows, threads>>>(
           out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
@@ -1961,16 +1898,31 @@ DeviceCsrMatrix compact_csr_by_masks_gpu(const DeviceCsrMatrix& A,
     } else {
       _kernel_copy_compacted_rows<<<old_row_blocks, threads>>>(
           out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
-          A.rowPtr, A.colVal, A.nzVal, long_row_threshold, A.rows);
+          A.rowPtr, A.colVal, A.nzVal, std::min(long_row_threshold, medium_threshold), A.rows);
       throw_if_cuda_error(cudaGetLastError(), "_kernel_copy_compacted_rows");
+      if (medium_count > 0) {
+        _kernel_compact_medium_rows<<<(medium_count + 7) / 8, threads>>>(
+            nullptr, out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
+            A.rowPtr, A.colVal, A.nzVal, medium_rows, medium_count);
+        throw_if_cuda_error(cudaGetLastError(), "copy compact medium_rows");
+      }
       if (long_row_count_host > 0) {
-        _kernel_copy_compacted_long_rows<<<long_row_count_host, threads>>>(
-            out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
-            A.rowPtr, A.colVal, A.nzVal, long_rows, long_row_count_host);
+        if (compact_long) {
+          // CUB's integer scan preserves stable element positions with fewer
+          // barriers than the legacy shared-memory scan for every 256 entries.
+          _kernel_copy_compacted_rows_block<<<long_row_count_host, threads>>>(
+              out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
+              A.rowPtr, A.colVal, A.nzVal, long_row_count_host, long_rows + (compact_warp ? A.rows - long_row_count_host : 0));
+        } else {
+          _kernel_copy_compacted_long_rows<<<long_row_count_host, threads>>>(
+              out.colVal, out.nzVal, out.rowPtr, row_old_to_new, col_old_to_new,
+              A.rowPtr, A.colVal, A.nzVal, long_rows + (compact_warp ? A.rows - long_row_count_host : 0), long_row_count_host);
+        }
         throw_if_cuda_error(cudaGetLastError(), "_kernel_copy_compacted_long_rows");
       }
     }
   }
+  detail.mark("copy_rows", true);
   stream_ordered_free(row_counts);
   stream_ordered_free(long_rows);
   stream_ordered_free(long_row_count);
@@ -1983,51 +1935,68 @@ struct WorkingLp {
 
   ~WorkingLp() { free_owned(); }
 
-  void free_owned() {
+  void free_owned(bool stream_ordered = false) {
     if (!owns) {
       return;
     }
-    cudaFree(lp.A.rowPtr);
-    cudaFree(lp.A.colVal);
-    cudaFree(lp.A.nzVal);
-    cudaFree(lp.AT.rowPtr);
-    cudaFree(lp.AT.colVal);
-    cudaFree(lp.AT.nzVal);
-    cudaFree(lp.c);
-    cudaFree(lp.AL);
-    cudaFree(lp.AU);
-    cudaFree(lp.l);
-    cudaFree(lp.u);
+    const auto release = [stream_ordered](void* ptr) {
+      if (stream_ordered) stream_ordered_free(ptr);
+      else cudaFree(ptr);
+    };
+    release(lp.A.rowPtr); release(lp.A.colVal); release(lp.A.nzVal);
+    release(lp.AT.rowPtr); release(lp.AT.colVal); release(lp.AT.nzVal);
+    release(lp.c); release(lp.AL); release(lp.AU); release(lp.l); release(lp.u);
     owns = false;
-  }
-
-  void free_owned_vectors() {
-    if (!owns) {
-      return;
-    }
-    cudaFree(lp.c);
-    cudaFree(lp.AL);
-    cudaFree(lp.AU);
-    cudaFree(lp.l);
-    cudaFree(lp.u);
-    lp.c = nullptr;
-    lp.AL = nullptr;
-    lp.AU = nullptr;
-    lp.l = nullptr;
-    lp.u = nullptr;
   }
 };
 
 void apply_plan_to_working_lp(WorkingLp& current,
-                              const PresolvePlanGpu& plan,
-                              PresolveRecordGpu* record) {
-  const bool profile_apply = env_enabled("GPUPRESOLVER_PRESOLVE_APPLY_PROFILE");
+                              PresolvePlanGpu& plan,
+                              PresolveRecordGpu* record,
+                              HostTapeChunks& tape_chunks) {
+  trace_recovery_plan(plan, current.lp);
+  const bool profile_apply = runtime::options().profile_apply;
   const auto apply_start = std::chrono::steady_clock::now();
   auto sync_for_profile = [&](const char* context) {
     if (profile_apply) {
       throw_if_cuda_error(cudaDeviceSynchronize(), context);
     }
   };
+  // Borrowed input storage and replacement matrices retain the materialization
+  // path. Action flags alone do not imply that an index was removed.
+  if (current.owns && !plan.has_new_A &&
+      detail::plan_keeps_all_indices(plan, current.lp.A.rows, current.lp.A.cols)) {
+    const auto after_masks = std::chrono::steady_clock::now();
+    if (record != nullptr) {
+      // Capture old bounds/maps before any in-place write. With identity maps,
+      // both recovery backends skip map compaction and accept null permutations.
+      update_record_from_plan(*record, plan, current.lp, current.lp.A.rows, current.lp.A.cols,
+                              current.lp.obj_constant + plan.obj_constant_delta,
+                              nullptr, nullptr, tape_chunks);
+    }
+    sync_for_profile("profile identity apply record synchronize");
+    const auto after_record = std::chrono::steady_clock::now();
+    detail::commit_identity_plan_vectors(plan, current.lp);
+    sync_for_profile("profile identity apply vectors synchronize");
+    const auto after_vectors = std::chrono::steady_clock::now();
+    current.lp.obj_constant += plan.obj_constant_delta;
+    if (profile_apply) {
+      const std::chrono::duration<double> masks_elapsed = after_masks - apply_start;
+      const std::chrono::duration<double> record_elapsed = after_record - after_masks;
+      const std::chrono::duration<double> vectors_elapsed = after_vectors - after_record;
+      const std::chrono::duration<double> total_elapsed = after_vectors - apply_start;
+      std::cerr << ">>> [GPU Presolve C++ apply-profile] structural_unchanged=true"
+                << " dims=(" << current.lp.A.rows << "," << current.lp.A.cols << ")->("
+                << current.lp.A.rows << "," << current.lp.A.cols << ")"
+                << " mask_check=" << masks_elapsed.count() << "s"
+                << " old_to_new=0s"
+                << " vectors=" << vectors_elapsed.count() << "s"
+                << " record=" << record_elapsed.count() << "s"
+                << " free=0s"
+                << " total=" << total_elapsed.count() << "s\n";
+    }
+    return;
+  }
   std::int32_t m_new = 0;
   std::int32_t n_new = 0;
   std::int32_t* row_old_to_new =
@@ -2036,57 +2005,13 @@ void apply_plan_to_working_lp(WorkingLp& current,
       build_old_to_new(plan.keep_col_mask, current.lp.A.cols, &n_new);
   sync_for_profile("profile apply build_old_to_new synchronize");
   const auto after_old_to_new = std::chrono::steady_clock::now();
-  const bool structural_unchanged =
-      current.owns && !plan.has_new_A && m_new == current.lp.A.rows && n_new == current.lp.A.cols;
   const double* c_source = plan.new_c != nullptr ? plan.new_c : current.lp.c;
   const double* l_source = plan.new_l != nullptr ? plan.new_l : current.lp.l;
   const double* u_source = plan.new_u != nullptr ? plan.new_u : current.lp.u;
   const double* AL_source = plan.new_AL != nullptr ? plan.new_AL : current.lp.AL;
   const double* AU_source = plan.new_AU != nullptr ? plan.new_AU : current.lp.AU;
-  if (structural_unchanged) {
-    double* c_new = clone_device_vector(c_source, current.lp.A.cols, "cudaMalloc/copy no-struct c");
-    double* l_new = clone_device_vector(l_source, current.lp.A.cols, "cudaMalloc/copy no-struct l");
-    double* u_new = clone_device_vector(u_source, current.lp.A.cols, "cudaMalloc/copy no-struct u");
-    double* AL_new = clone_device_vector(AL_source, current.lp.A.rows, "cudaMalloc/copy no-struct AL");
-    double* AU_new = clone_device_vector(AU_source, current.lp.A.rows, "cudaMalloc/copy no-struct AU");
-    sync_for_profile("profile apply clone no-struct vectors synchronize");
-    const auto after_vectors = std::chrono::steady_clock::now();
-    if (record != nullptr) {
-      update_record_from_plan(*record, plan, current.lp, m_new, n_new,
-                              current.lp.obj_constant + plan.obj_constant_delta,
-                              col_old_to_new);
-    }
-    sync_for_profile("profile apply no-struct record synchronize");
-    const auto after_record = std::chrono::steady_clock::now();
-    cudaFree(row_old_to_new);
-    cudaFree(col_old_to_new);
-    current.free_owned_vectors();
-    sync_for_profile("profile apply no-struct free synchronize");
-    const auto after_free = std::chrono::steady_clock::now();
-    current.lp.c = c_new;
-    current.lp.l = l_new;
-    current.lp.u = u_new;
-    current.lp.AL = AL_new;
-    current.lp.AU = AU_new;
-    current.lp.obj_constant += plan.obj_constant_delta;
-    current.owns = true;
-    if (profile_apply) {
-      const std::chrono::duration<double> old_to_new_elapsed = after_old_to_new - apply_start;
-      const std::chrono::duration<double> vectors_elapsed = after_vectors - after_old_to_new;
-      const std::chrono::duration<double> record_elapsed = after_record - after_vectors;
-      const std::chrono::duration<double> free_elapsed = after_free - after_record;
-      const std::chrono::duration<double> total_elapsed = after_free - apply_start;
-      std::cerr << ">>> [GPU Presolve C++ apply-profile] structural_unchanged=true"
-                << " dims=(" << current.lp.A.rows << "," << current.lp.A.cols << ")->("
-                << m_new << "," << n_new << ")"
-                << " old_to_new=" << old_to_new_elapsed.count() << "s"
-                << " vectors=" << vectors_elapsed.count() << "s"
-                << " record=" << record_elapsed.count() << "s"
-                << " free=" << free_elapsed.count() << "s"
-                << " total=" << total_elapsed.count() << "s\n";
-    }
-    return;
-  }
+  // Any materialization can replace/reorder coefficients and recycle addresses.
+  invalidate_matrix_analysis();
   const DeviceCsrMatrix& source_A = plan.has_new_A ? plan.new_A : current.lp.A;
   DeviceCsrMatrix A_new = compact_csr_by_masks_gpu(
       source_A, row_old_to_new, col_old_to_new, m_new, n_new);
@@ -2104,15 +2029,15 @@ void apply_plan_to_working_lp(WorkingLp& current,
   const auto after_vectors = std::chrono::steady_clock::now();
   if (record != nullptr) {
     update_record_from_plan(*record, plan, current.lp, m_new, n_new,
-                            current.lp.obj_constant + plan.obj_constant_delta,
-                            col_old_to_new);
+                            current.lp.obj_constant + plan.obj_constant_delta, row_old_to_new,
+                            col_old_to_new, tape_chunks);
   }
   sync_for_profile("profile apply record synchronize");
   const auto after_record = std::chrono::steady_clock::now();
-  cudaFree(row_old_to_new);
-  cudaFree(col_old_to_new);
+  stream_ordered_free(row_old_to_new);
+  stream_ordered_free(col_old_to_new);
 
-  current.free_owned();
+  current.free_owned(true);
   sync_for_profile("profile apply free synchronize");
   const auto after_free = std::chrono::steady_clock::now();
   current.lp.A = A_new;
@@ -2146,44 +2071,43 @@ void apply_plan_to_working_lp(WorkingLp& current,
   }
 }
 
-}  // namespace
-
-bool _has_good_nnz_progress(std::int32_t nnz_before,
-                            std::int32_t nnz_after,
-                            double ratio) {
-  if (nnz_before <= 0) {
-    return false;
-  }
-  return static_cast<double>(nnz_after) < ratio * static_cast<double>(nnz_before);
+bool has_good_nnz_progress(NnzOffset nnz_before,
+                           NnzOffset nnz_after,
+                           NnzOffset minimum_decrease) {
+  return nnz_before >= minimum_decrease &&
+         nnz_after <= nnz_before - minimum_decrease;
 }
-
-namespace {
 
 GpuPresolveSummary run_gpu_presolve_impl(const LPInfoGpu& lp,
                                          const PresolveParams& input_params,
                                          bool keep_reduced_lp) {
+  MatrixAnalysisScope matrix_analysis_scope;
+  CleanupWorkspaceScope cleanup_workspace_scope;
+  DuplicateRuleWorkspaceScope duplicate_rule_workspace_scope;
   PresolveParams effective_params = input_params;
   if (!effective_params.enable_structure_specific_rules) {
-    effective_params.enable_covering_cost_dominance = false;
-    effective_params.enable_linf_components = false;
-    effective_params.enable_antipodal_components = false;
-    effective_params.enable_bounded_two_row_projection = false;
-    effective_params.enable_orphan_mccormick_projection = false;
-    effective_params.enable_structural_l1_substitution = false;
+    effective_params.enable_column_domination = false;
+    effective_params.enable_variable_pair_aggregation = false;
+    effective_params.enable_two_row_variable_elimination = false;
+    effective_params.enable_mccormick_variable_elimination = false;
+    effective_params.enable_absolute_value_epigraph_reduction = false;
   }
   const PresolveParams& params = effective_params;
 
   struct RuleWorkspaceReleaseGuard {
     ~RuleWorkspaceReleaseGuard() {
-      release_implied_variable_bounds_workspace();
-      release_column_singletons_workspace();
+      if (!bound_strengthening_workspace_prepared()) {
+        release_bound_strengthening_workspace();
+      }
+      release_singleton_columns_workspace();
     }
   } rule_workspace_release_guard;
 
   const bool profile_record =
-      env_enabled("GPUPRESOLVER_PRESOLVE_RECORD_PROFILE");
+      runtime::options().profile_records;
   const auto initial_record_start = std::chrono::steady_clock::now();
   GpuPresolveSummary summary;
+  HostTapeChunks tape_chunks;
   summary.original_rows = lp.A.rows;
   summary.original_cols = lp.A.cols;
   summary.record = make_initial_record(lp);
@@ -2199,15 +2123,15 @@ GpuPresolveSummary run_gpu_presolve_impl(const LPInfoGpu& lp,
   current.lp = lp;
 
   bool terminal = false;
-  const bool profile_rules = env_enabled("GPUPRESOLVER_PRESOLVE_RULE_PROFILE");
+  const bool profile_rules = runtime::options().profile_rules;
+  const bool incremental_live_stats = runtime::options().incremental_live_stats;
+  const bool profile_live_stats = runtime::options().profile_live_stats;
+  std::int64_t full_stats_refreshes = 0;
+  std::int64_t incremental_stats_updates = 0;
+  // Complete initial recovery-map GPU work before timing the presolve core.
+  throw_if_cuda_error(cudaDeviceSynchronize(), "presolve initialization complete");
   const auto presolve_start = std::chrono::steady_clock::now();
   const bool has_time_limit = params.max_time > 0.0 && std::isfinite(params.max_time);
-  bool column_singletons_dual_clean = false;
-  bool column_singletons_eq_clean = false;
-  auto invalidate_column_singleton_clean = [&]() {
-    column_singletons_dual_clean = false;
-    column_singletons_eq_clean = false;
-  };
   auto time_exceeded = [&]() -> bool {
     if (!has_time_limit) {
       return false;
@@ -2216,1166 +2140,484 @@ GpuPresolveSummary run_gpu_presolve_impl(const LPInfoGpu& lp,
     return elapsed.count() >= params.max_time;
   };
 
-  auto run_row_phase = [&](bool empty_rows,
-                           bool singleton_rows,
-                           bool infeasible_redundant_rows,
-                           bool implied_variable_bounds,
-                           bool duplicate_rows) -> bool {
-    if (terminal || time_exceeded()) {
-      return false;
-    }
-    const auto phase_start = std::chrono::steady_clock::now();
+  // These rules construct a replacement matrix and retain their own APPLY boundary.
+  auto run_materialized_rule = [&](bool enabled, const char* name, auto rule) -> bool {
+    if (!enabled || terminal || time_exceeded()) return false;
+    const auto start = std::chrono::steady_clock::now();
     PresolvePlanGpu plan;
-    PresolveStatsGpu stats;
-    const bool run_empty_rows = empty_rows && params.enable_empty_rows;
-    const bool run_singleton_rows = singleton_rows && params.enable_singleton_rows;
-    const bool run_infeasible_redundant_rows = infeasible_redundant_rows && params.enable_infeasible_redundant_rows;
-    const bool run_implied_variable_bounds =
-        implied_variable_bounds && params.enable_implied_variable_bounds;
-    const bool run_duplicate_rows = duplicate_rows && params.enable_duplicate_rows;
-    PlanRequirements plan_requirements;
-    plan_requirements.objective = run_implied_variable_bounds;
-    plan_requirements.col_bounds =
-        run_singleton_rows || run_infeasible_redundant_rows || run_implied_variable_bounds;
-    plan_requirements.row_bounds = run_empty_rows || run_singleton_rows ||
-                                   run_infeasible_redundant_rows || run_implied_variable_bounds ||
-                                   run_duplicate_rows;
-    allocate_plan(plan, current.lp, plan_requirements);
-    StatsRequirements stats_requirements;
-    stats_requirements.row_nnz =
-        (empty_rows && params.enable_empty_rows) ||
-        (infeasible_redundant_rows && params.enable_infeasible_redundant_rows) ||
-        (implied_variable_bounds && params.enable_implied_variable_bounds);
-    stats_requirements.singleton_rows = singleton_rows && params.enable_singleton_rows;
-    const bool needs_row_stats =
-        stats_requirements.row_nnz || stats_requirements.singleton_rows;
-    allocate_stats(stats, current.lp.A.rows, current.lp.A.cols, stats_requirements);
-    if (needs_row_stats) {
-      recompute_row_stats_from_csr(stats, current.lp);
-    }
-    auto after_stats = std::chrono::steady_clock::now();
-    const std::int32_t m_before = current.lp.A.rows;
-    const std::int32_t n_before = current.lp.A.cols;
-    const std::int32_t nnz_before = current.lp.A.nnz;
-    std::string rules;
-    if (empty_rows && params.enable_empty_rows) append_rule_name(rules, "empty_rows");
-    if (singleton_rows && params.enable_singleton_rows) append_rule_name(rules, "singleton_rows");
-    if (infeasible_redundant_rows && params.enable_infeasible_redundant_rows) append_rule_name(rules, "infeasible_redundant_rows");
-    if (implied_variable_bounds && params.enable_implied_variable_bounds) append_rule_name(rules, "implied_variable_bounds");
-    if (duplicate_rows && params.enable_duplicate_rows) append_rule_name(rules, "duplicate_rows");
-
-    if (!time_exceeded() && empty_rows && params.enable_empty_rows) apply_rule_empty_rows(plan, current.lp, stats, params);
-    if (!time_exceeded() && singleton_rows && params.enable_singleton_rows) apply_rule_singleton_rows(plan, current.lp, stats, params);
-    if (!time_exceeded() && infeasible_redundant_rows && params.enable_infeasible_redundant_rows) apply_rule_infeasible_redundant_rows(plan, current.lp, stats, params);
-    if (!time_exceeded() && implied_variable_bounds && params.enable_implied_variable_bounds) apply_rule_implied_variable_bounds(plan, current.lp, stats, params);
-    if (!time_exceeded() && duplicate_rows && params.enable_duplicate_rows) apply_rule_duplicate_rows(plan, current.lp, stats, params);
-    auto after_plan = std::chrono::steady_clock::now();
-
-    summary.has_infeasible = plan.has_infeasible;
-    summary.has_unbounded = plan.has_unbounded;
-    terminal = plan.has_infeasible || plan.has_unbounded;
-    const bool changed = !terminal && plan.has_change;
-    if (changed) {
-      apply_plan_to_working_lp(current, plan, &summary.record);
-      invalidate_column_singleton_clean();
-    }
-    auto after_apply = std::chrono::steady_clock::now();
-    if (profile_rules) {
-      throw_if_cuda_error(cudaDeviceSynchronize(), "profile row phase synchronize");
-      const std::chrono::duration<double> phase_elapsed =
-          std::chrono::steady_clock::now() - phase_start;
-      const std::chrono::duration<double> stats_elapsed = after_stats - phase_start;
-      const std::chrono::duration<double> plan_elapsed = after_plan - after_stats;
-      const std::chrono::duration<double> apply_elapsed = after_apply - after_plan;
-      std::cerr << ">>> [GPU Presolve C++ profile] phase=row rules=[" << rules << "] changed="
-                << (changed ? "true" : "false") << " dims=(" << m_before << "," << n_before
-                << ")->(" << current.lp.A.rows << "," << current.lp.A.cols << ") nnz="
-                << nnz_before << "->" << current.lp.A.nnz
-                << " time=" << phase_elapsed.count() << "s stats=" << stats_elapsed.count()
-                << "s plan=" << plan_elapsed.count() << "s apply=" << apply_elapsed.count()
-                << "s\n";
-    }
-    free_stats(stats);
-    free_plan(plan);
-    return changed;
-  };
-
-  auto run_col_phase = [&](bool infeasible_fixed_variables,
-                           bool empty_cols,
-                           bool column_singletons_dual,
-                           bool column_singletons_eq,
-                           bool doubleton_equations,
-                           bool structural_l1,
-                           bool dual_fix,
-                           bool duplicate_columns,
-                           bool redundant_bounds) -> bool {
-    if (terminal || time_exceeded()) {
-      return false;
-    }
-    const auto phase_start = std::chrono::steady_clock::now();
-    const bool structural_only =
-        !infeasible_fixed_variables && !empty_cols && !column_singletons_dual && !column_singletons_eq &&
-        !doubleton_equations && structural_l1 && !dual_fix && !duplicate_columns && !redundant_bounds &&
-        params.enable_structural_l1_substitution;
-    if (structural_only && !structural_l1_prefix_screen_passes(current.lp)) {
-      if (profile_rules) {
-        throw_if_cuda_error(cudaDeviceSynchronize(), "profile structural prefix screen synchronize");
-        const std::chrono::duration<double> phase_elapsed =
-            std::chrono::steady_clock::now() - phase_start;
-        std::cerr << ">>> [GPU Presolve C++ profile] phase=col rules=[structural_l1_substitution] changed=false"
-                  << " dims=(" << current.lp.A.rows << "," << current.lp.A.cols << ")->("
-                  << current.lp.A.rows << "," << current.lp.A.cols << ") nnz="
-                  << current.lp.A.nnz << "->" << current.lp.A.nnz
-                  << " time=" << phase_elapsed.count() << "s\n";
-      }
-      return false;
-    }
-    PresolvePlanGpu plan;
-    PresolveStatsGpu stats;
-    const bool run_infeasible_fixed_variables = infeasible_fixed_variables && params.enable_infeasible_fixed_variables;
-    const bool run_empty_cols = empty_cols && params.enable_empty_cols;
-    const bool run_column_singletons_dual =
-        column_singletons_dual && params.enable_column_singletons_dual_infer;
-    const bool run_column_singletons_eq =
-        column_singletons_eq && params.enable_column_singletons_eq;
-    const bool run_doubleton_equations = doubleton_equations && params.enable_doubleton_equations;
-    const bool run_structural_l1 =
-        structural_l1 && params.enable_structural_l1_substitution;
-    const bool run_dual_fix = dual_fix && params.enable_dual_fix;
-    const bool run_duplicate_columns = duplicate_columns && params.enable_duplicate_columns;
-    const bool run_redundant_bounds =
-        redundant_bounds && (params.enable_redundant_bounds ||
-                             params.enable_zero_cost_redundant_box_bounds);
-    PlanRequirements plan_requirements;
-    plan_requirements.objective = run_infeasible_fixed_variables || run_empty_cols ||
-                                  run_column_singletons_dual || run_column_singletons_eq ||
-                                  run_doubleton_equations || run_structural_l1 || run_dual_fix ||
-                                  run_duplicate_columns;
-    plan_requirements.col_bounds = plan_requirements.objective || run_redundant_bounds;
-    plan_requirements.row_bounds = run_infeasible_fixed_variables || run_column_singletons_dual ||
-                                   run_column_singletons_eq || run_doubleton_equations ||
-                                   run_structural_l1 || run_dual_fix ||
-                                   run_duplicate_columns || run_redundant_bounds;
-    allocate_plan(plan, current.lp, plan_requirements);
-    StatsRequirements stats_requirements;
-    stats_requirements.empty_cols = empty_cols && params.enable_empty_cols;
-    stats_requirements.column_singletons =
-        (column_singletons_dual && params.enable_column_singletons_dual_infer) ||
-        (column_singletons_eq && params.enable_column_singletons_eq);
-    const bool needs_col_stats =
-        stats_requirements.empty_cols || stats_requirements.column_singletons;
-    allocate_stats(stats, current.lp.A.rows, current.lp.A.cols, stats_requirements);
-    if (needs_col_stats) {
-      recompute_col_stats_from_csr(stats, current.lp);
-    }
-    auto after_stats = std::chrono::steady_clock::now();
-    const std::int32_t m_before = current.lp.A.rows;
-    const std::int32_t n_before = current.lp.A.cols;
-    const std::int32_t nnz_before = current.lp.A.nnz;
-    std::string rules;
-    if (infeasible_fixed_variables && params.enable_infeasible_fixed_variables) append_rule_name(rules, "infeasible_fixed_variables");
-    if (empty_cols && params.enable_empty_cols) append_rule_name(rules, "empty_cols");
-    if (column_singletons_dual && params.enable_column_singletons_dual_infer) append_rule_name(rules, "column_singletons_dual_infer");
-    if (column_singletons_eq && params.enable_column_singletons_eq) append_rule_name(rules, "column_singletons_eq");
-    if (doubleton_equations && params.enable_doubleton_equations) append_rule_name(rules, "doubleton_equations");
-    if (structural_l1 && params.enable_structural_l1_substitution) append_rule_name(rules, "structural_l1_substitution");
-    if (dual_fix && params.enable_dual_fix) append_rule_name(rules, "dual_fix");
-    if (duplicate_columns && params.enable_duplicate_columns) append_rule_name(rules, "duplicate_columns");
-    if (run_redundant_bounds) {
-      append_rule_name(rules,
-                       params.enable_redundant_bounds
-                           ? "redundant_bounds"
-                           : "zero_cost_redundant_box_bounds");
-    }
-
-    if (!time_exceeded() && infeasible_fixed_variables && params.enable_infeasible_fixed_variables) apply_rule_infeasible_fixed_variables(plan, current.lp, params);
-    if (!time_exceeded() && empty_cols && params.enable_empty_cols) apply_rule_empty_cols(plan, current.lp, stats, params);
-    if (!time_exceeded() && column_singletons_dual && params.enable_column_singletons_dual_infer) {
-      apply_rule_column_singletons_dual_infer(plan, current.lp, stats, params);
-    }
-    if (!time_exceeded() && column_singletons_eq && params.enable_column_singletons_eq) {
-      apply_rule_column_singletons_eq(plan, current.lp, stats, params);
-    }
-    if (!time_exceeded() && doubleton_equations && params.enable_doubleton_equations) apply_rule_doubleton_equations(plan, current.lp, stats, params);
-    if (!time_exceeded() && structural_l1 && params.enable_structural_l1_substitution) {
-      apply_rule_structural_l1_substitution(plan, current.lp, stats, params);
-    }
-    if (!time_exceeded() && dual_fix && params.enable_dual_fix) apply_rule_dual_fix(plan, current.lp, stats, params);
-    if (!time_exceeded() && duplicate_columns && params.enable_duplicate_columns) apply_rule_duplicate_columns(plan, current.lp, stats, params);
-    if (!time_exceeded() && run_redundant_bounds) {
-      apply_rule_redundant_bounds(plan, current.lp, stats, params);
-    }
-    auto after_plan = std::chrono::steady_clock::now();
-
-    summary.has_infeasible = plan.has_infeasible;
-    summary.has_unbounded = plan.has_unbounded;
-    terminal = plan.has_infeasible || plan.has_unbounded;
-    const bool changed = !terminal && plan.has_change;
-    if (changed) {
-      apply_plan_to_working_lp(current, plan, &summary.record);
-      invalidate_column_singleton_clean();
-    } else {
-      const bool singleton_dual_only =
-          !infeasible_fixed_variables && !empty_cols && column_singletons_dual && !column_singletons_eq &&
-          !doubleton_equations && !structural_l1 && !dual_fix && !duplicate_columns && !redundant_bounds &&
-          params.enable_column_singletons_dual_infer;
-      const bool singleton_eq_only =
-          !infeasible_fixed_variables && !empty_cols && !column_singletons_dual && column_singletons_eq &&
-          !doubleton_equations && !structural_l1 && !dual_fix && !duplicate_columns && !redundant_bounds &&
-          params.enable_column_singletons_eq;
-      if (singleton_dual_only) {
-        column_singletons_dual_clean = true;
-      }
-      if (singleton_eq_only) {
-        column_singletons_eq_clean = true;
-      }
-    }
-    auto after_apply = std::chrono::steady_clock::now();
-    if (profile_rules) {
-      throw_if_cuda_error(cudaDeviceSynchronize(), "profile col phase synchronize");
-      const std::chrono::duration<double> phase_elapsed =
-          std::chrono::steady_clock::now() - phase_start;
-      const std::chrono::duration<double> stats_elapsed = after_stats - phase_start;
-      const std::chrono::duration<double> plan_elapsed = after_plan - after_stats;
-      const std::chrono::duration<double> apply_elapsed = after_apply - after_plan;
-      std::cerr << ">>> [GPU Presolve C++ profile] phase=col rules=[" << rules << "] changed="
-                << (changed ? "true" : "false") << " dims=(" << m_before << "," << n_before
-                << ")->(" << current.lp.A.rows << "," << current.lp.A.cols << ") nnz="
-                << nnz_before << "->" << current.lp.A.nnz
-                << " time=" << phase_elapsed.count() << "s stats=" << stats_elapsed.count()
-                << "s plan=" << plan_elapsed.count() << "s apply=" << apply_elapsed.count()
-                << "s\n";
-    }
-    free_stats(stats);
-    free_plan(plan);
-    return changed;
-  };
-
-  auto run_singleton_rows_to_exhaustion = [&]() -> bool {
-    bool changed_any = false;
-    while (!terminal && !time_exceeded()) {
-      const bool changed = run_row_phase(false, true, false, false, false);
-      changed_any = changed_any || changed;
-      if (!changed) {
-        break;
-      }
-    }
-    return changed_any;
-  };
-
-  auto run_trivial_cleanup_recirculation = [&]() -> bool {
-    bool changed_any = false;
-    while (!terminal && !time_exceeded()) {
-      bool changed_pass = false;
-      changed_pass = run_col_phase(true, true, false, false, false, false, false, false, false) || changed_pass;
-      changed_pass = run_row_phase(true, true, false, false, false) || changed_pass;
-      changed_pass = run_col_phase(false, true, false, false, false, false, false, false, false) || changed_pass;
-      changed_any = changed_pass || changed_any;
-      if (!changed_pass) {
-        break;
-      }
-    }
-    return changed_any;
-  };
-
-  auto run_cleanup = [&]() -> bool {
-    bool changed_any = false;
-    changed_any = run_col_phase(true, true, false, false, false, false, false, false, false) || changed_any;
-    changed_any = run_col_phase(false, false, false, false, false, false, true, false, false) || changed_any;
-    changed_any = run_singleton_rows_to_exhaustion() || changed_any;
-    changed_any = run_row_phase(true, false, false, false, false) || changed_any;
-    changed_any = run_col_phase(false, true, false, false, false, false, false, false, false) || changed_any;
-    return changed_any;
-  };
-
-  auto run_repeated_doubleton = [&]() -> bool {
-    bool changed_any = false;
-    while (!terminal && !time_exceeded()) {
-      const bool changed = run_col_phase(false, false, false, false, true, false, false, false, false);
-      changed_any = changed_any || changed;
-      if (!changed || params.doubleton_equations_single_batch_per_iter) {
-        break;
-      }
-    }
-    return changed_any;
-  };
-
-  // Batch the column-singleton -> dual-fix -> singleton-row cascade in one
-  // plan. Live statistics honor the masks, so A and AT need only one
-  // compaction while reduction and postsolve tape order are preserved.
-  auto run_batched_singleton_cleanup_closure = [&]() -> bool {
-    constexpr std::int32_t kMinNnzForBatchedClosure = 10000000;
-    if (terminal || time_exceeded() ||
-        current.lp.A.nnz < kMinNnzForBatchedClosure ||
-        !params.enable_column_singletons_eq || !params.enable_dual_fix ||
-        !params.enable_singleton_rows) {
-      return false;
-    }
-
-    const auto phase_start = std::chrono::steady_clock::now();
-    const std::int32_t m_before = current.lp.A.rows;
-    const std::int32_t n_before = current.lp.A.cols;
-    const std::int32_t nnz_before = current.lp.A.nnz;
-    PresolvePlanGpu plan;
-    PresolveStatsGpu stats;
-    PlanRequirements plan_requirements;
-    allocate_plan(plan, current.lp, plan_requirements);
-    StatsRequirements stats_requirements;
-    stats_requirements.row_nnz = true;
-    stats_requirements.col_nnz = true;
-    stats_requirements.singleton_rows = true;
-    stats_requirements.column_singletons = true;
-    allocate_stats(stats, current.lp.A.rows, current.lp.A.cols, stats_requirements);
-
-    recompute_row_stats_from_csr(stats, current.lp);
-    recompute_col_stats_from_csr(stats, current.lp);
-    std::uint8_t* keep_row_before = nullptr;
-    std::uint8_t* keep_col_before = nullptr;
-    std::uint8_t* dual_candidate_mask = nullptr;
-    std::uint8_t* dual_keep_row_seen = nullptr;
-    double* dual_c_seen = nullptr;
-    double* dual_l_seen = nullptr;
-    double* dual_u_seen = nullptr;
-    double* dual_AL_seen = nullptr;
-    double* dual_AU_seen = nullptr;
-    throw_if_cuda_error(cudaMalloc(&keep_row_before,
-                                   static_cast<std::size_t>(current.lp.A.rows)),
-                        "cudaMalloc batched closure previous row mask");
-    throw_if_cuda_error(cudaMalloc(&keep_col_before,
-                                   static_cast<std::size_t>(current.lp.A.cols)),
-                        "cudaMalloc batched closure previous col mask");
-    throw_if_cuda_error(cudaMalloc(&dual_candidate_mask,
-                                   static_cast<std::size_t>(current.lp.A.cols)),
-                        "cudaMalloc batched closure dual candidates");
-    throw_if_cuda_error(cudaMalloc(&dual_keep_row_seen,
-                                   static_cast<std::size_t>(current.lp.A.rows)),
-                        "cudaMalloc batched closure dual row mask snapshot");
-    throw_if_cuda_error(cudaMalloc(&dual_c_seen,
-                                   sizeof(double) *
-                                       static_cast<std::size_t>(current.lp.A.cols)),
-                        "cudaMalloc batched closure dual c snapshot");
-    throw_if_cuda_error(cudaMalloc(&dual_l_seen,
-                                   sizeof(double) *
-                                       static_cast<std::size_t>(current.lp.A.cols)),
-                        "cudaMalloc batched closure dual l snapshot");
-    throw_if_cuda_error(cudaMalloc(&dual_u_seen,
-                                   sizeof(double) *
-                                       static_cast<std::size_t>(current.lp.A.cols)),
-                        "cudaMalloc batched closure dual u snapshot");
-    throw_if_cuda_error(cudaMalloc(&dual_AL_seen,
-                                   sizeof(double) *
-                                       static_cast<std::size_t>(current.lp.A.rows)),
-                        "cudaMalloc batched closure dual AL snapshot");
-    throw_if_cuda_error(cudaMalloc(&dual_AU_seen,
-                                   sizeof(double) *
-                                       static_cast<std::size_t>(current.lp.A.rows)),
-                        "cudaMalloc batched closure dual AU snapshot");
-    throw_if_cuda_error(cudaMemcpy(keep_row_before,
-                                   plan.keep_row_mask,
-                                   static_cast<std::size_t>(current.lp.A.rows),
-                                   cudaMemcpyDeviceToDevice),
-                        "cudaMemcpy batched closure previous row mask");
-    throw_if_cuda_error(cudaMemcpy(keep_col_before,
-                                   plan.keep_col_mask,
-                                   static_cast<std::size_t>(current.lp.A.cols),
-                                   cudaMemcpyDeviceToDevice),
-                        "cudaMemcpy batched closure previous col mask");
-    auto snapshot_dual_state = [&]() {
-      throw_if_cuda_error(cudaMemcpy(dual_keep_row_seen,
-                                     plan.keep_row_mask,
-                                     static_cast<std::size_t>(current.lp.A.rows),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual row mask snapshot");
-      throw_if_cuda_error(cudaMemcpy(dual_c_seen,
-                                     plan.new_c,
-                                     sizeof(double) *
-                                         static_cast<std::size_t>(current.lp.A.cols),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual c snapshot");
-      throw_if_cuda_error(cudaMemcpy(dual_l_seen,
-                                     plan.new_l,
-                                     sizeof(double) *
-                                         static_cast<std::size_t>(current.lp.A.cols),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual l snapshot");
-      throw_if_cuda_error(cudaMemcpy(dual_u_seen,
-                                     plan.new_u,
-                                     sizeof(double) *
-                                         static_cast<std::size_t>(current.lp.A.cols),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual u snapshot");
-      throw_if_cuda_error(cudaMemcpy(dual_AL_seen,
-                                     plan.new_AL,
-                                     sizeof(double) *
-                                         static_cast<std::size_t>(current.lp.A.rows),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual AL snapshot");
-      throw_if_cuda_error(cudaMemcpy(dual_AU_seen,
-                                     plan.new_AU,
-                                     sizeof(double) *
-                                         static_cast<std::size_t>(current.lp.A.rows),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy dual AU snapshot");
-    };
-    snapshot_dual_state();
-
-    auto mark_incremental_dual_candidates = [&]() {
-      constexpr int threads = 256;
-      const int row_blocks = (current.lp.A.rows + threads - 1) / threads;
-      const int col_blocks = (current.lp.A.cols + threads - 1) / threads;
-      _kernel_mark_changed_dual_cols<<<col_blocks, threads>>>(
-          dual_candidate_mask,
-          plan.keep_col_mask,
-          plan.new_c,
-          plan.new_l,
-          plan.new_u,
-          dual_c_seen,
-          dual_l_seen,
-          dual_u_seen,
-          current.lp.A.cols);
-      throw_if_cuda_error(cudaGetLastError(), "_kernel_mark_changed_dual_cols");
-      _kernel_mark_dual_cols_from_changed_rows<<<row_blocks, threads>>>(
-          dual_candidate_mask,
-          plan.keep_row_mask,
-          plan.keep_col_mask,
-          plan.new_AL,
-          plan.new_AU,
-          dual_keep_row_seen,
-          dual_AL_seen,
-          dual_AU_seen,
-          current.lp.A.rowPtr,
-          current.lp.A.colVal,
-          current.lp.A.rows);
-      throw_if_cuda_error(cudaGetLastError(),
-                          "_kernel_mark_dual_cols_from_changed_rows");
-    };
-
-    auto refresh_incremental_stats = [&]() {
-      constexpr int threads = 256;
-      const int row_blocks = (current.lp.A.rows + threads - 1) / threads;
-      const int col_blocks = (current.lp.A.cols + threads - 1) / threads;
-      _kernel_update_row_degrees_from_removed_cols<<<col_blocks, threads>>>(
-          stats.row_nnz,
-          keep_col_before,
-          plan.keep_col_mask,
-          plan.keep_row_mask,
-          current.lp.AT.rowPtr,
-          current.lp.AT.colVal,
-          current.lp.A.cols);
-      throw_if_cuda_error(cudaGetLastError(),
-                          "_kernel_update_row_degrees_from_removed_cols");
-      _kernel_update_col_degrees_from_removed_rows<<<row_blocks, threads>>>(
-          stats.col_nnz,
-          keep_row_before,
-          plan.keep_row_mask,
-          plan.keep_col_mask,
-          current.lp.A.rowPtr,
-          current.lp.A.colVal,
-          current.lp.A.rows);
-      throw_if_cuda_error(cudaGetLastError(),
-                          "_kernel_update_col_degrees_from_removed_rows");
-      throw_if_cuda_error(cudaMemcpy(keep_row_before,
-                                     plan.keep_row_mask,
-                                     static_cast<std::size_t>(current.lp.A.rows),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy refresh previous row mask");
-      throw_if_cuda_error(cudaMemcpy(keep_col_before,
-                                     plan.keep_col_mask,
-                                     static_cast<std::size_t>(current.lp.A.cols),
-                                     cudaMemcpyDeviceToDevice),
-                          "cudaMemcpy refresh previous col mask");
-      _kernel_refresh_singleton_rows_from_degrees<<<row_blocks, threads>>>(
-          stats.singleton_row_mask,
-          stats.singleton_row_col,
-          stats.singleton_row_val,
-          stats.row_nnz,
-          plan.keep_row_mask,
-          plan.keep_col_mask,
-          current.lp.A.rowPtr,
-          current.lp.A.colVal,
-          current.lp.A.nzVal,
-          current.lp.A.rows);
-      throw_if_cuda_error(cudaGetLastError(),
-                          "_kernel_refresh_singleton_rows_from_degrees");
-      _kernel_refresh_column_singletons_from_degrees<<<col_blocks, threads>>>(
-          stats.column_singleton_mask,
-          stats.column_singleton_row,
-          stats.column_singleton_val,
-          stats.col_nnz,
-          plan.keep_row_mask,
-          plan.keep_col_mask,
-          current.lp.AT.rowPtr,
-          current.lp.AT.colVal,
-          current.lp.AT.nzVal,
-          current.lp.A.cols);
-      throw_if_cuda_error(cudaGetLastError(),
-                          "_kernel_refresh_column_singletons_from_degrees");
-    };
-
-    bool changed_any = false;
-    bool first_dual_sweep = true;
-    std::int32_t rounds = 0;
-    double eq_seconds = 0.0;
-    double dual_seconds = 0.0;
-    double refresh_seconds = 0.0;
-    double row_seconds = 0.0;
-    while (!terminal && !time_exceeded()) {
-      const auto eq_start = std::chrono::steady_clock::now();
-      plan.has_change = false;
-      // Let the rule kernels detect the final empty round, avoiding a separate
-      // column scan to count candidates.
-      apply_rule_column_singletons_eq(plan, current.lp, stats, params, true);
-      eq_seconds += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - eq_start).count();
-      const bool changed_eq = plan.has_change;
+    PresolveStatsGpu stats{};
+    allocate_plan(plan, current.lp, PlanRequirements{true, true, true});
+    try {
+      rule(plan, current.lp, stats, params);
+      summary.has_infeasible = plan.has_infeasible;
+      summary.has_unbounded = plan.has_unbounded;
       terminal = plan.has_infeasible || plan.has_unbounded;
-
-      bool changed_dual = false;
-      if (!terminal && !time_exceeded()) {
-        const auto dual_start = std::chrono::steady_clock::now();
-        if (first_dual_sweep) {
-          throw_if_cuda_error(cudaMemset(dual_candidate_mask,
-                                        1,
-                                        static_cast<std::size_t>(current.lp.A.cols)),
-                              "cudaMemset initial dual candidate sweep");
-          first_dual_sweep = false;
-        } else {
-          mark_incremental_dual_candidates();
-        }
-        // Snapshot pre-commit locks so row removals and shifts from dual-fix
-        // remain detectable in the next closure round.
-        snapshot_dual_state();
-        plan.has_change = false;
-        apply_rule_dual_fix(
-            plan, current.lp, stats, params, dual_candidate_mask);
-        dual_seconds += std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - dual_start).count();
-        changed_dual = plan.has_change;
-        terminal = plan.has_infeasible || plan.has_unbounded;
+      const bool changed = !terminal && plan.has_change;
+      if (changed) {
+        apply_plan_to_working_lp(current, plan, &summary.record, tape_chunks);
+        if (std::string(name) == "startup_absolute_value_epigraph")
+          write_diagnostic_snapshot(name, current.lp);
+        if (profile_rules) std::cerr << ">>> [schedule-apply] boundary=" << name << '\n';
       }
-
-      bool changed_rows = false;
-      if (!terminal && !time_exceeded()) {
-        const auto refresh_start = std::chrono::steady_clock::now();
-        refresh_incremental_stats();
-        if (profile_rules) {
-          throw_if_cuda_error(cudaDeviceSynchronize(),
-                              "profile incremental stats refresh synchronize");
-        }
-        refresh_seconds += std::chrono::duration<double>(
-                               std::chrono::steady_clock::now() - refresh_start).count();
-        const auto row_start = std::chrono::steady_clock::now();
-        plan.has_change = false;
-        apply_rule_singleton_rows(plan, current.lp, stats, params);
-        row_seconds += std::chrono::duration<double>(
-                           std::chrono::steady_clock::now() - row_start).count();
-        changed_rows = plan.has_change;
-        terminal = plan.has_infeasible || plan.has_unbounded;
-        if (!terminal && changed_rows) {
-          const auto refresh_start_after_rows = std::chrono::steady_clock::now();
-          refresh_incremental_stats();
-          if (profile_rules) {
-            throw_if_cuda_error(cudaDeviceSynchronize(),
-                                "profile post-row stats refresh synchronize");
-          }
-          refresh_seconds += std::chrono::duration<double>(
-                                 std::chrono::steady_clock::now() -
-                                 refresh_start_after_rows).count();
-        }
+      if (profile_rules) {
+        std::cerr << ">>> [GPU Presolve C++ profile] phase=" << name
+                  << " changed=" << (changed ? "true" : "false")
+                  << " time=" << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start).count() << "s\n";
       }
+      free_plan(plan);
+      return changed;
+    } catch (...) {
+      free_plan(plan);
+      throw;
+    }
+  };
 
-      const bool changed_round = changed_eq || changed_dual || changed_rows;
-      changed_any = changed_any || changed_round;
-      ++rounds;
-      if (!changed_round) {
-        break;
+  struct DeferredState {
+    PresolvePlanGpu plan;
+    PresolveStatsGpu stats;
+    std::uint8_t* entry_cols = nullptr;
+    double* reference_bounds = nullptr;
+    std::uint8_t* stats_rows = nullptr;
+    std::uint8_t* stats_cols = nullptr;
+    std::int32_t* touched_rows = nullptr;
+    std::int32_t* touched_cols = nullptr;
+    unsigned long long* device_live_nnz = nullptr;
+    bool borrowed_buffers = false;
+    bool active = false, pending = false, stats_dirty = false, nnz_dirty = false;
+    void reset() {
+      free_plan(plan); free_stats(stats);
+      if (!borrowed_buffers) {
+        cudaFree(entry_cols); cudaFree(reference_bounds); cudaFree(device_live_nnz);
+      }
+      cudaFree(stats_rows); cudaFree(stats_cols);
+      cudaFree(touched_rows); cudaFree(touched_cols);
+      plan = {}; stats = {}; entry_cols = nullptr; reference_bounds = nullptr;
+      stats_rows = stats_cols = nullptr;
+      touched_rows = touched_cols = nullptr;
+      device_live_nnz = nullptr;
+      borrowed_buffers = false;
+      active = pending = stats_dirty = nnz_dirty = false;
+    }
+    ~DeferredState() { reset(); }
+  } deferred;
+  auto prepare_deferred = [&]() {
+    if (deferred.active) return;
+    allocate_plan(deferred.plan, current.lp, PlanRequirements{});
+    allocate_stats(deferred.stats, current.lp.A.rows, current.lp.A.cols,
+                   StatsRequirements{true, true, true, true, true, true});
+    const int m = current.lp.A.rows;
+    const int n = current.lp.A.cols;
+    if (incremental_live_stats) {
+      if (m) {
+        throw_if_cuda_error(cudaMalloc(&deferred.stats_rows, m), "schedule stats row snapshot");
+        throw_if_cuda_error(cudaMalloc(&deferred.touched_rows, sizeof(int) * std::size_t(m)),
+                            "schedule touched rows");
+      }
+      if (n) {
+        throw_if_cuda_error(cudaMalloc(&deferred.stats_cols, n), "schedule stats col snapshot");
+        throw_if_cuda_error(cudaMalloc(&deferred.touched_cols, sizeof(int) * std::size_t(n)),
+                            "schedule touched cols");
       }
     }
-
+    if (auto* pool = cleanup_scratch::active_pool) {
+      deferred.borrowed_buffers = true;
+      deferred.device_live_nnz = static_cast<unsigned long long*>(
+          pool->reserve(cleanup_scratch::deferred_live_nnz_slot,
+                        sizeof(*deferred.device_live_nnz)));
+      if (n) {
+        deferred.entry_cols = static_cast<std::uint8_t*>(
+            pool->reserve(cleanup_scratch::deferred_entry_cols_slot, n));
+        deferred.reference_bounds = static_cast<double*>(
+            pool->reserve(cleanup_scratch::deferred_reference_bounds_slot,
+                          2 * sizeof(double) * n));
+      }
+    } else {
+      throw_if_cuda_error(cudaMalloc(&deferred.device_live_nnz, sizeof(*deferred.device_live_nnz)),
+                          "schedule live nnz");
+      if (n) {
+        throw_if_cuda_error(cudaMalloc(&deferred.entry_cols, n), "schedule entry columns");
+        throw_if_cuda_error(cudaMalloc(&deferred.reference_bounds, 2 * sizeof(double) * n),
+                            "schedule reference bounds");
+      }
+    }
+    deferred.plan.rule_entry_keep_col = deferred.entry_cols;
+    deferred.plan.cleanup_entry_keep_col = deferred.entry_cols;
+    deferred.active = deferred.stats_dirty = deferred.nnz_dirty = true;
+  };
+  auto refresh_deferred_stats = [&]() {
+    if (deferred.stats_dirty) {
+      bool updated = false;
+      if (incremental_live_stats && deferred.stats.live_masks) {
+        updated = update_live_stats_from_deletions(
+            deferred.stats, current.lp, deferred.plan, deferred.stats_rows,
+            deferred.stats_cols, deferred.touched_rows, deferred.touched_cols,
+            false, deferred.device_live_nnz);
+      }
+      if (updated) ++incremental_stats_updates;
+      else {
+        refresh_live_stats(deferred.stats, current.lp, deferred.plan, false,
+                           deferred.device_live_nnz);
+        ++full_stats_refreshes;
+      }
+      if (incremental_live_stats) {
+        const int m = current.lp.A.rows;
+        const int n = current.lp.A.cols;
+        if (m) throw_if_cuda_error(cudaMemcpy(deferred.stats_rows, deferred.plan.keep_row_mask,
+            m, cudaMemcpyDeviceToDevice), "snapshot live row mask");
+        if (n) throw_if_cuda_error(cudaMemcpy(deferred.stats_cols, deferred.plan.keep_col_mask,
+            n, cudaMemcpyDeviceToDevice), "snapshot live col mask");
+      }
+      deferred.stats_dirty = false;
+    }
+  };
+  auto live_nnz = [&]() -> NnzOffset {
+    if (!deferred.active) return current.lp.A.nnz;
+    refresh_deferred_stats();
+    if (deferred.nnz_dirty) {
+      unsigned long long count = 0;
+      throw_if_cuda_error(cudaMemcpy(&count, deferred.device_live_nnz, sizeof(count),
+                                    cudaMemcpyDeviceToHost), "schedule read live nnz");
+      deferred.stats.live_nnz = static_cast<NnzOffset>(count);
+      deferred.nnz_dirty = false;
+    }
+    return deferred.stats.live_nnz;
+  };
+  // Count actual new deletions using flags already copied by each rule.
+  // The serial survives per-rule resets and Apply, without extra GPU work.
+  std::uint64_t deletion_serial = 0;
+  auto deferred_rule = [&](bool enabled, const char* name, auto rule) -> bool {
+    if (!enabled || terminal || time_exceeded()) return false;
+    prepare_deferred();
+    refresh_deferred_stats();
+    auto& plan = deferred.plan;
+    const int n = current.lp.A.cols;
+    if (n) throw_if_cuda_error(cudaMemcpy(deferred.entry_cols, plan.keep_col_mask, n,
+                                          cudaMemcpyDeviceToDevice), "schedule entry mask");
+    plan.has_change = plan.has_row_action = plan.has_col_action = false;
+    plan.has_redundant_row_deletion = plan.has_row_deletion = false;
+    plan.obj_constant_delta = 0;
+    if (std::string(name) == "parallel_columns")
+      write_diagnostic_snapshot("before_parallel_columns", current.lp, &plan);
+    rule(plan, deferred.stats);
+    if (std::string(name) == "parallel_columns")
+      write_diagnostic_snapshot("after_parallel_columns", current.lp, &plan);
     summary.has_infeasible = plan.has_infeasible;
     summary.has_unbounded = plan.has_unbounded;
-    plan.has_change = changed_any;
-    if (changed_any && !terminal) {
-      apply_plan_to_working_lp(current, plan, &summary.record);
-      invalidate_column_singleton_clean();
-    }
-    if (profile_rules) {
-      throw_if_cuda_error(cudaDeviceSynchronize(),
-                          "profile batched singleton closure synchronize");
-      const std::chrono::duration<double> phase_elapsed =
-          std::chrono::steady_clock::now() - phase_start;
-      std::cerr << ">>> [GPU Presolve C++ profile] phase=closure"
-                << " rules=[column_singletons_eq,dual_fix,singleton_rows] changed="
-                << (changed_any ? "true" : "false") << " rounds=" << rounds
-                << " dims=(" << m_before << "," << n_before << ")->("
-                << current.lp.A.rows << "," << current.lp.A.cols << ") nnz="
-                << nnz_before << "->" << current.lp.A.nnz
-                << " time=" << phase_elapsed.count() << "s"
-                << " eq=" << eq_seconds << "s"
-                << " dual=" << dual_seconds << "s"
-                << " refresh=" << refresh_seconds << "s"
-                << " rows=" << row_seconds << "s\n";
-    }
-    cudaFree(keep_row_before);
-    cudaFree(keep_col_before);
-    cudaFree(dual_candidate_mask);
-    cudaFree(dual_keep_row_seen);
-    cudaFree(dual_c_seen);
-    cudaFree(dual_l_seen);
-    cudaFree(dual_u_seen);
-    cudaFree(dual_AL_seen);
-    cudaFree(dual_AU_seen);
-    free_stats(stats);
-    free_plan(plan);
-    return changed_any;
-  };
-
-  auto run_fast_phase = [&]() -> bool {
-    bool changed_any = false;
-    bool changed_singleton = false;
-    changed_any = run_batched_singleton_cleanup_closure() || changed_any;
-    while (!terminal && !time_exceeded()) {
-      const bool changed_dual =
-          column_singletons_dual_clean ? false
-                                    : run_col_phase(false, false, true, false, false, false, false, false, false);
-      const bool changed_eq =
-          column_singletons_eq_clean ? false
-                                  : run_col_phase(false, false, false, true, false, false, false, false, false);
-      const bool changed = changed_dual || changed_eq;
-      changed_any = changed_any || changed;
-      changed_singleton = changed_singleton || changed;
-      if (changed) {
-        changed_any = run_cleanup() || changed_any;
-      }
-      if (!changed) {
-        break;
-      }
-    }
-    const bool changed_doubleton = run_repeated_doubleton();
-    changed_any = changed_doubleton || changed_any;
-    if (changed_doubleton || changed_singleton) {
-      changed_any = run_cleanup() || changed_any;
-    }
-    return changed_any;
-  };
-
-  // Propagate from each round's entry bounds until stable or a limit is reached.
-  // Commit row shifts immediately; batch pure bound tightenings in one plan
-  // to preserve tape order without repeated copies or sparse-map scans.
-  auto run_implied_variable_bounds_with_activity_closure = [&]() -> bool {
-    if (!params.enable_implied_variable_bounds) {
-      return false;
-    }
-    bool changed_any = false;
-    const int max_rounds = std::max(1, params.implied_variable_bounds_max_rounds);
-    const int configured_max_bound_only_rounds =
-        std::max(1, params.implied_variable_bounds_max_bound_only_rounds);
-    // For the wide, dense shape below, allow a second confirmation round
-    // when the work cap would stop propagation after one changing round.
-    // The configured round limits still apply.
-    const std::int64_t propagation_rows =
-        static_cast<std::int64_t>(current.lp.A.rows);
-    const std::int64_t propagation_cols =
-        static_cast<std::int64_t>(current.lp.A.cols);
-    const std::int64_t propagation_nnz =
-        static_cast<std::int64_t>(current.lp.A.nnz);
-    const bool allow_wide_dense_confirmation_round =
-        propagation_rows >= 512 && propagation_rows <= 2048 &&
-        propagation_cols >= 128 * propagation_rows &&
-        propagation_cols <= 256 * propagation_rows &&
-        propagation_nnz >= 2048 * propagation_rows &&
-        propagation_nnz <= 8192 * propagation_rows;
-    auto effective_max_bound_only_rounds = [&]() -> int {
-      int effective = configured_max_bound_only_rounds;
-      const std::int64_t budget =
-          params.implied_variable_bounds_bound_only_nnz_round_budget;
-      if (budget <= 0 || current.lp.A.nnz <= 0) {
-        return effective;
-      }
-      const std::int64_t nnz = static_cast<std::int64_t>(current.lp.A.nnz);
-      const std::int64_t budget_rounds = std::max<std::int64_t>(1, budget / nnz);
-      if (budget_rounds < static_cast<std::int64_t>(effective)) {
-        effective = static_cast<int>(budget_rounds);
-      }
-      if (allow_wide_dense_confirmation_round) {
-        effective = std::max(
-            effective, std::min(2, configured_max_bound_only_rounds));
-      }
-      return effective;
-    };
-    int rounds = 0;
-    int bound_only_rounds = 0;
-    int bound_only_round_limit = configured_max_bound_only_rounds;
-    bool stopped_on_bound_only_work_cap = false;
-    const auto closure_start = std::chrono::steady_clock::now();
-    while (rounds < max_rounds && !terminal && !time_exceeded()) {
-      bound_only_round_limit = effective_max_bound_only_rounds();
-      PresolvePlanGpu plan;
-      PlanRequirements plan_requirements;
-      plan_requirements.objective = true;
-      plan_requirements.col_bounds = true;
-      plan_requirements.row_bounds = true;
-      allocate_plan(plan, current.lp, plan_requirements);
-
-      PresolveStatsGpu stats;
-      StatsRequirements stats_requirements;
-      stats_requirements.row_nnz = true;
-      allocate_stats(stats,
-                     current.lp.A.rows,
-                     current.lp.A.cols,
-                     stats_requirements);
-      recompute_row_stats_from_csr(stats, current.lp);
-
-      bool group_changed = false;
-      bool structural_change = false;
-      while (rounds < max_rounds && !terminal && !time_exceeded()) {
-        plan.has_change = false;
-        apply_rule_implied_variable_bounds(plan, current.lp, stats, params);
-        ++rounds;
-        summary.has_infeasible = plan.has_infeasible;
-        summary.has_unbounded = plan.has_unbounded;
-        terminal = plan.has_infeasible || plan.has_unbounded;
-        if (terminal || !plan.has_change) {
-          break;
-        }
-        group_changed = true;
-        changed_any = true;
-        structural_change = plan.has_new_A || plan.has_row_action ||
-                            plan.has_col_action;
-        if (structural_change) {
-          bound_only_rounds = 0;
-          break;
-        }
-        ++bound_only_rounds;
-        if (bound_only_rounds >= bound_only_round_limit) {
-          stopped_on_bound_only_work_cap =
-              bound_only_round_limit < configured_max_bound_only_rounds;
-          break;
-        }
-      }
-
-      if (group_changed && !terminal) {
-        apply_plan_to_working_lp(current, plan, &summary.record);
-        invalidate_column_singleton_clean();
-      }
-      free_stats(stats);
-      free_plan(plan);
-      if (terminal || !group_changed || !structural_change ||
-          bound_only_rounds >= bound_only_round_limit) {
-        break;
-      }
-    }
-    if (profile_rules) {
-      throw_if_cuda_error(cudaDeviceSynchronize(),
-                          "profile implied variable bounds closure synchronize");
-      const std::chrono::duration<double> elapsed =
-          std::chrono::steady_clock::now() - closure_start;
-      std::cerr << ">>> [GPU Presolve C++ profile] phase=primal_closure"
-                << " changed=" << (changed_any ? "true" : "false")
-                << " rounds=" << rounds
-                << " bound_only_limit=" << bound_only_round_limit
-                << " work_cap_hit="
-                << (stopped_on_bound_only_work_cap ? "true" : "false")
-                << " confirmation_round_guard="
-                << (allow_wide_dense_confirmation_round ? "true" : "false")
-                << " time=" << elapsed.count() << "s\n";
-    }
-    if (changed_any && !terminal && !time_exceeded()) {
-      changed_any = run_row_phase(false, false, true, false, false) || changed_any;
-    }
-    return changed_any;
-  };
-
-  auto run_medium_phase = [&]() -> bool {
-    bool changed_any = false;
-    bool changed_prop = false;
-    changed_prop = run_row_phase(false, false, true, false, false) || changed_prop;
-    changed_prop = run_implied_variable_bounds_with_activity_closure() || changed_prop;
-    changed_any = changed_prop || changed_any;
-    if (changed_prop) {
-      changed_any = run_cleanup() || changed_any;
-    }
-    const bool changed_duplicate_rows = run_row_phase(false, false, false, false, true);
-    changed_any = changed_duplicate_rows || changed_any;
-    const bool changed_duplicate_columns = run_col_phase(false, false, false, false, false, false, false, true, false);
-    changed_any = changed_duplicate_columns || changed_any;
-    if (changed_duplicate_rows || changed_duplicate_columns) {
-      changed_any = run_cleanup() || changed_any;
-    }
-    return changed_any;
-  };
-
-  auto run_fixed_row_sequence = [&]() -> bool {
-    bool changed_any = false;
-    changed_any = run_row_phase(true, false, false, false, false) || changed_any;
-    changed_any = run_row_phase(false, true, false, false, false) || changed_any;
-    changed_any = run_row_phase(false, false, true, false, false) || changed_any;
-    const bool changed_primal = run_implied_variable_bounds_with_activity_closure();
-    changed_any = changed_primal || changed_any;
-    if (changed_primal) {
-      changed_any = run_trivial_cleanup_recirculation() || changed_any;
-    }
-    changed_any = run_row_phase(false, false, false, false, true) || changed_any;
-    return changed_any;
-  };
-
-  auto run_cleanup_trigger_col_rule = [&](bool infeasible_fixed_variables,
-                                          bool column_singletons_dual,
-                                          bool column_singletons_eq,
-                                          bool doubleton_equations,
-                                          bool structural_l1,
-                                          bool dual_fix,
-                                          bool duplicate_columns) -> bool {
-    const bool changed = run_col_phase(infeasible_fixed_variables,
-                                       false,
-                                       column_singletons_dual,
-                                       column_singletons_eq,
-                                       doubleton_equations,
-                                       structural_l1,
-                                       dual_fix,
-                                       duplicate_columns,
-                                       false);
+    terminal = plan.has_infeasible || plan.has_unbounded;
+    const bool changed = plan.has_change && !terminal;
     if (changed) {
-      (void)run_trivial_cleanup_recirculation();
+      if (plan.has_row_deletion || plan.has_col_action) ++deletion_serial;
+      current.lp.obj_constant += plan.obj_constant_delta;
+      if (summary.record.device) {
+        capture_cleanup_recovery(summary.record, plan, current.lp, current.lp.obj_constant);
+      } else {
+        // The explicit host recovery backend keeps the same logical boundaries.
+        update_record_from_plan(summary.record, plan, current.lp, current.lp.A.rows, n,
+                                current.lp.obj_constant, nullptr, nullptr, tape_chunks);
+        if (plan.has_col_action) {
+          const auto before = copy_device_array(deferred.entry_cols, n, "schedule entry mask host");
+          const auto after = copy_device_array(plan.keep_col_mask, n, "schedule current mask host");
+          std::vector<std::int32_t> removed;
+          for (int j = 0; j < n; ++j) if (before[j] && !after[j]) removed.push_back(j);
+          append_removed_fixed_bound_records_sparse(summary.record, removed, plan.new_l, plan.new_u,
+              summary.record.col_red2org, "schedule fixed records");
+        }
+        plan.tape = {};
+        plan.cleanup_recovery_captured = true;
+      }
+      deferred.pending = true;
+      if (plan.has_row_action || plan.has_col_action) {
+        deferred.stats_dirty = true;
+        deferred.nnz_dirty = true;
+      }
     }
+    plan.obj_constant_delta = 0;
+    if (profile_rules) std::cerr << ">>> [schedule-rule] rule=" << name << " changed=" << changed << '\n';
     return changed;
   };
+  auto cleanup = [&]() -> bool {
+    if (profile_rules) std::cerr << ">>> [schedule-phase] phase=cleanup\n";
+    bool changed = deferred_rule(params.enable_infeasible_and_fixed_variables, "infeasible_and_fixed_variables",
+        [&](auto& p, const auto&) { apply_rule_infeasible_and_fixed_variables(p, current.lp, params); });
+    changed = deferred_rule(params.enable_empty_columns, "empty_columns",
+        [&](auto& p, const auto& s) { apply_rule_empty_columns(p, current.lp, s, params); }) || changed;
+    changed = deferred_rule(params.enable_empty_rows, "empty_rows",
+        [&](auto& p, const auto& s) { apply_rule_empty_rows(p, current.lp, s, params); }) || changed;
+    changed = deferred_rule(params.enable_singleton_rows, "singleton_rows",
+        [&](auto& p, const auto& s) { apply_rule_singleton_rows(p, current.lp, s, params); }) || changed;
+    changed = deferred_rule(params.enable_singleton_columns, "singleton_columns",
+        [&](auto& p, const auto& s) { apply_rule_singleton_columns(p, current.lp, s, params); }) || changed;
+    return changed;
+  };
+  auto materialize = [&](const char* boundary) {
+    if (deferred.pending) {
+      deferred.plan.has_change = true;
+      apply_plan_to_working_lp(current, deferred.plan, &summary.record, tape_chunks);
+      if (profile_rules) std::cerr << ">>> [schedule-apply] boundary=" << boundary << '\n';
+    }
+    deferred.reset();
+  };
+  if (params.enable_startup && params.max_iters > 0 && !time_exceeded()) {
+    // The first three structural rules only delete
+    // rows/columns and share a plan; each detector sees the preceding masks.
+    PresolvePlanGpu batch;
+    bool batch_allocated = false;
+    auto prepare_batch = [&]() {
+      if (!batch_allocated) {
+        allocate_plan(batch, current.lp, PlanRequirements{false, true, false});
+        batch_allocated = true;
+      }
+    };
+    auto batch_rule = [&](bool enabled, const char* name, auto analyze, auto build, auto release) {
+      if (!enabled || terminal || time_exceeded()) return;
+      const auto start = std::chrono::steady_clock::now();
+      auto analysis = analyze();
+      try {
+        if (analysis.applicable) {
+          prepare_batch();
+          build(batch, current.lp, analysis, params);
+        }
+        if (profile_rules) {
+          std::cerr << ">>> [GPU Presolve C++ profile] phase=startup_" << name
+                    << " candidates=" << analysis.candidate_count
+                    << " time=" << std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - start).count() << "s\n";
+        }
+        release(analysis);
+      } catch (...) {
+        release(analysis);
+        throw;
+      }
+    };
+    try {
+      batch_rule(params.enable_column_domination, "column_domination",
+          [&]() { return analyze_column_domination(current.lp, params); },
+          build_column_domination_plan, free_column_domination_analysis);
+      batch_rule(params.enable_two_row_variable_elimination, "two_row_variable_elimination",
+          [&]() { return analyze_two_row_variable_elimination(
+              current.lp, params, batch_allocated ? &batch : nullptr); },
+          build_two_row_variable_elimination_plan, free_two_row_variable_elimination_analysis);
+      batch_rule(params.enable_mccormick_variable_elimination, "mccormick_variable_elimination",
+          [&]() { return analyze_mccormick_variable_elimination(
+              current.lp, params, batch_allocated ? &batch : nullptr); },
+          build_mccormick_variable_elimination_plan, free_mccormick_variable_elimination_analysis);
+      // Commit accepted reductions even if the time limit expired between rules.
+      if (batch.has_change) {
+        apply_plan_to_working_lp(current, batch, &summary.record, tape_chunks);
+        if (profile_rules) std::cerr << ">>> [schedule-apply] boundary=startup_projection_batch\n";
+      }
+      free_plan(batch);
+    } catch (...) {
+      free_plan(batch);
+      throw;
+    }
 
-  auto run_fixed_col_sequence = [&]() -> bool {
-    bool changed_any = false;
-    changed_any = run_cleanup_trigger_col_rule(true, false, false, false, false, false, false) || changed_any;
-    changed_any = run_cleanup_trigger_col_rule(false, false, false, false, true, false, false) || changed_any;
-    changed_any = run_col_phase(false, true, false, false, false, false, false, false, false) || changed_any;
+    if (!terminal && !time_exceeded() && params.enable_variable_pair_aggregation) {
+      const auto phase_start = std::chrono::steady_clock::now();
+      const auto m_before = current.lp.A.rows;
+      const auto n_before = current.lp.A.cols;
+      const auto nnz_before = current.lp.A.nnz;
+      PresolvePlanGpu plan;
+      const auto selected = build_variable_pair_aggregation_plan(
+          plan, current.lp, params, time_exceeded);
+      summary.has_infeasible = plan.has_infeasible;
+      summary.has_unbounded = plan.has_unbounded;
+      terminal = plan.has_infeasible || plan.has_unbounded;
+      const bool changed = !terminal && plan.has_change;
+      if (changed) {
+        apply_plan_to_working_lp(current, plan, &summary.record, tape_chunks);
+        if (profile_rules) std::cerr << ">>> [schedule-apply] boundary=startup_variable_pair_aggregation\n";
+      }
+      free_plan(plan);
+      if (profile_rules) {
+        throw_if_cuda_error(cudaDeviceSynchronize(), "profile variable-pair aggregation");
+        const char* name = selected == VariablePairAggregationCase::Epigraph ? "epigraph" :
+            selected == VariablePairAggregationCase::ShiftedAntipodal ? "shifted_antipodal" : "none";
+        std::cerr << ">>> [GPU Presolve C++ profile] phase=startup_variable_pair_aggregation"
+                  << " case=" << name << " changed=" << (changed ? "true" : "false")
+                  << " dims=(" << m_before << "," << n_before << ")->("
+                  << current.lp.A.rows << "," << current.lp.A.cols << ") nnz="
+                  << nnz_before << "->" << current.lp.A.nnz
+                  << " time=" << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - phase_start).count() << "s\n";
+      }
+    }
 
-    bool changed_rule = false;
-    do {
-      changed_rule = run_cleanup_trigger_col_rule(false, true, false, false, false, false, false);
-      changed_any = changed_rule || changed_any;
-    } while (changed_rule && !terminal && !time_exceeded());
+    if (params.enable_absolute_value_epigraph_reduction && !terminal && !time_exceeded() &&
+        absolute_value_epigraph_prefix_screen_passes(current.lp)) {
+      run_materialized_rule(true, "startup_absolute_value_epigraph",
+                            apply_rule_absolute_value_epigraph_reduction);
+    }
 
-    do {
-      changed_rule = run_cleanup_trigger_col_rule(false, false, true, false, false, false, false);
-      changed_any = changed_rule || changed_any;
-    } while (changed_rule && !terminal && !time_exceeded());
+    ++summary.iterations;
+  }
 
-    do {
-      changed_rule = run_cleanup_trigger_col_rule(false, false, false, true, false, false, false);
-      changed_any = changed_rule || changed_any;
-    } while (changed_rule && !params.doubleton_equations_single_batch_per_iter && !terminal && !time_exceeded());
-
-    changed_any = run_cleanup_trigger_col_rule(false, false, false, false, false, true, false) || changed_any;
-    changed_any = run_cleanup_trigger_col_rule(false, false, false, false, false, false, true) || changed_any;
-    return changed_any;
+  auto propagation = [&]() -> bool {
+    bool bounds_changed = false;
+    if (profile_rules) std::cerr << ">>> [schedule-phase] phase=propagation\n";
+    if (params.enable_bound_strengthening && !terminal && !time_exceeded()) {
+      prepare_deferred();
+      auto& plan = deferred.plan;
+      const int n = current.lp.A.cols;
+      if (n) {
+        throw_if_cuda_error(cudaMemcpy(deferred.reference_bounds, plan.new_l, sizeof(double)*n,
+                                      cudaMemcpyDeviceToDevice), "propagation lower reference");
+        throw_if_cuda_error(cudaMemcpy(deferred.reference_bounds+n, plan.new_u, sizeof(double)*n,
+                                      cudaMemcpyDeviceToDevice), "propagation upper reference");
+        plan.propagation_reference_l = deferred.reference_bounds;
+        plan.propagation_reference_u = deferred.reference_bounds+n;
+      }
+      bounds_changed = deferred_rule(true, "bound_strengthening", [&](auto& p, const auto& s) {
+            apply_rule_bound_strengthening(p, current.lp, s, params);
+          });
+    }
+    deferred_rule(params.enable_infeasible_and_redundant_rows, "infeasible_and_redundant_rows",
+        [&](auto& p, const auto& s) { apply_rule_infeasible_and_redundant_rows(p, current.lp, s, params); });
+    deferred_rule(params.enable_dual_fix, "dual_fix",
+        [&](auto& p, const auto& s) { apply_rule_dual_fix(p, current.lp, s, params); });
+    return bounds_changed;
   };
 
-  if (!params.use_tiered_scheduler) {
-    for (int iter = 0; iter < params.max_iters && !terminal && !time_exceeded(); ++iter) {
-      bool changed_iter = false;
-      changed_iter = run_fixed_row_sequence() || changed_iter;
-      changed_iter = run_fixed_col_sequence() || changed_iter;
-      ++summary.iterations;
-      if (!changed_iter) {
+  enum class SchedulePhase { Cleanup, Propagation, Aggregation, Parallel };
+  auto phase_name = [](SchedulePhase value) {
+    switch (value) {
+      case SchedulePhase::Cleanup: return "cleanup";
+      case SchedulePhase::Propagation: return "propagation";
+      case SchedulePhase::Aggregation: return "aggregation";
+      case SchedulePhase::Parallel: return "parallel";
+    }
+    return "unknown";
+  };
+  SchedulePhase phase = SchedulePhase::Cleanup;
+  constexpr NnzOffset minimum_nnz_decrease = 100;
+  int bound_only_rounds = 0;
+  auto cleanup_phase = [&](NnzOffset stage_nnz_before) {
+    const auto deletion_serial_before = deletion_serial;
+    const bool changed = cleanup();
+    const bool deleted_rows_or_cols = deletion_serial != deletion_serial_before;
+    if (deleted_rows_or_cols) bound_only_rounds = 0;
+    const auto nnz_after = live_nnz();
+    phase = changed ? SchedulePhase::Cleanup : SchedulePhase::Propagation;
+    if (profile_rules) std::cerr << ">>> [schedule-progress] phase=cleanup stage_before=" << stage_nnz_before
+        << " after=" << nnz_after << " next=" << phase_name(phase)
+        << " pending=" << deferred.pending << " deleted=" << deleted_rows_or_cols
+        << " changed=" << changed
+        << " bound_only_rounds=" << bound_only_rounds << '\n';
+  };
+  // Fix L before the first Cleanup. Every Cleanup invocation runs through the
+  // main loop and repeats on any new update without consuming iteration budget.
+  const NnzOffset initial_live_nnz =
+      params.max_iters > 0 && !terminal && !time_exceeded() ? live_nnz() : 0;
+  const int configured_bound_only_limit =
+      std::max(1, params.bound_strengthening_max_bound_only_rounds);
+  const int bound_only_limit = [&]() {
+    int limit = configured_bound_only_limit;
+    if (params.bound_strengthening_bound_only_nnz_round_budget > 0 && initial_live_nnz > 0) {
+      limit = static_cast<int>(std::min<std::int64_t>(limit,
+          std::max<std::int64_t>(1,
+              params.bound_strengthening_bound_only_nnz_round_budget / initial_live_nnz)));
+    }
+    // Retain the old minimum-two-round exception for this matrix shape.
+    const std::int64_t m = current.lp.A.rows, n = current.lp.A.cols;
+    if (m >= 512 && m <= 2048 && n >= 128*m && n <= 256*m &&
+        initial_live_nnz >= 2048*m && initial_live_nnz <= 8192*m) {
+      limit = std::max(limit, std::min(2, configured_bound_only_limit));
+    }
+    return limit;
+  }();
+  if (profile_rules) std::cerr << ">>> [schedule-bound-budget] initial_nnz=" << initial_live_nnz
+      << " limit=" << bound_only_limit << '\n';
+  while (params.max_iters > 0 && !terminal && !time_exceeded()) {
+    // Cleanup can finish even after Startup or another phase used the budget.
+    // Only Propagation, Aggregation and Parallel consume main-loop iterations.
+    if (phase != SchedulePhase::Cleanup) {
+      if (summary.iterations >= params.max_iters) {
+        summary.stopped_at_iteration_limit = true;
         break;
       }
-    }
-  } else {
-    if (params.enable_tiered_bootstrap && params.max_iters > 0 && !time_exceeded()) {
-      // Run model-wide reductions before structural L1 and generic rewrites
-      // to preserve their original-layout certificates.
-      if (!terminal && params.enable_covering_cost_dominance) {
-        CoveringCostDominanceAnalysisGpu analysis =
-            analyze_covering_cost_dominance(current.lp, params);
-        if (analysis.applicable) {
-          PresolvePlanGpu plan;
-          allocate_plan(plan, current.lp,
-                        PlanRequirements{/*objective=*/false,
-                                         /*col_bounds=*/true,
-                                         /*row_bounds=*/false});
-          build_covering_cost_dominance_plan(plan, current.lp, analysis,
-                                             params);
-          const bool changed_covering = plan.has_change;
-          if (changed_covering) {
-            apply_plan_to_working_lp(current, plan, &summary.record);
-            invalidate_column_singleton_clean();
-          }
-
-          free_plan(plan);
-        }
-        free_covering_cost_dominance_analysis(analysis);
-      }
-
-      bool changed_linf_components = false;
-      if (!terminal && !time_exceeded() && params.enable_linf_components) {
-        const std::int32_t m_before = current.lp.A.rows;
-        const std::int32_t n_before = current.lp.A.cols;
-        const std::int32_t nnz_before = current.lp.A.nnz;
-        const auto phase_start = std::chrono::steady_clock::now();
-        LinfComponentAnalysisGpu analysis =
-            analyze_linf_components(current.lp, params);
-        if (analysis.applicable) {
-          PresolvePlanGpu plan;
-          allocate_plan(plan, current.lp, PlanRequirements{});
-          build_linf_component_plan(plan, current.lp, analysis, params);
-          summary.has_infeasible = plan.has_infeasible;
-          summary.has_unbounded = plan.has_unbounded;
-          terminal = plan.has_infeasible || plan.has_unbounded;
-          changed_linf_components = !terminal && plan.has_change;
-          if (changed_linf_components) {
-            apply_plan_to_working_lp(current, plan, &summary.record);
-            invalidate_column_singleton_clean();
-          }
-          free_plan(plan);
-        }
-        free_linf_component_analysis(analysis);
-
-        if (profile_rules) {
-          throw_if_cuda_error(cudaDeviceSynchronize(),
-                              "profile bootstrap Linf component synchronize");
-          const std::chrono::duration<double> elapsed =
-              std::chrono::steady_clock::now() - phase_start;
-          std::cerr << ">>> [GPU Presolve C++ profile]"
-                    << " phase=bootstrap_linf_components"
-                    << " changed="
-                    << (changed_linf_components ? "true" : "false")
-                    << " dims=(" << m_before << "," << n_before << ")->("
-                    << current.lp.A.rows << "," << current.lp.A.cols << ")"
-                    << " nnz=" << nnz_before << "->" << current.lp.A.nnz
-                    << " time=" << elapsed.count() << "s\n";
-        }
-      }
-
-      if (!terminal && !changed_linf_components && !time_exceeded() &&
-          params.enable_antipodal_components) {
-        AntipodalComponentAnalysisGpu analysis =
-            analyze_antipodal_components(current.lp, params);
-        if (analysis.applicable) {
-          const std::int32_t m_before = current.lp.A.rows;
-          const std::int32_t n_before = current.lp.A.cols;
-          const std::int32_t nnz_before = current.lp.A.nnz;
-          PresolvePlanGpu plan;
-          allocate_plan(plan, current.lp, PlanRequirements{});
-          build_antipodal_component_plan(plan, current.lp, analysis, params);
-          summary.has_infeasible = plan.has_infeasible;
-          summary.has_unbounded = plan.has_unbounded;
-          terminal = plan.has_infeasible || plan.has_unbounded;
-          const bool changed_antipodal = !terminal && plan.has_change;
-          if (changed_antipodal) {
-            apply_plan_to_working_lp(current, plan, &summary.record);
-            invalidate_column_singleton_clean();
-          }
-
-          if (profile_rules) {
-            throw_if_cuda_error(
-                cudaDeviceSynchronize(),
-                "profile bootstrap antipodal component synchronize");
-            std::cerr << ">>> [GPU Presolve C++ profile]"
-                      << " phase=bootstrap_antipodal_components"
-                      << " changed="
-                      << (changed_antipodal ? "true" : "false")
-                      << " dims=(" << m_before << "," << n_before << ")->("
-                      << current.lp.A.rows << "," << current.lp.A.cols
-                      << ") nnz=" << nnz_before << "->" << current.lp.A.nnz
-                      << "\n";
-          }
-          free_plan(plan);
-        }
-        free_antipodal_component_analysis(analysis);
-      }
-
-      // Commit the degree-two projection before detecting orphan McCormick
-      // columns: rebuilding AT exposes their degree-three incidence.
-      // Record both steps in order for postsolve, before structural L1.
-      if (!terminal && !time_exceeded() &&
-          params.enable_bounded_two_row_projection) {
-        const std::int32_t m_before = current.lp.A.rows;
-        const std::int32_t n_before = current.lp.A.cols;
-        const std::int32_t nnz_before = current.lp.A.nnz;
-        const auto phase_start = std::chrono::steady_clock::now();
-        BoundedTwoRowProjectionAnalysisGpu analysis =
-            analyze_bounded_two_row_projection(current.lp, params);
-        bool changed_projection = false;
-        if (analysis.applicable) {
-          PresolvePlanGpu plan;
-          allocate_plan(plan, current.lp,
-                        PlanRequirements{/*objective=*/false,
-                                         /*col_bounds=*/false,
-                                         /*row_bounds=*/false});
-          build_bounded_two_row_projection_plan(plan, current.lp, analysis,
-                                                params);
-          changed_projection = plan.has_change;
-          if (changed_projection) {
-            apply_plan_to_working_lp(current, plan, &summary.record);
-            invalidate_column_singleton_clean();
-          }
-          free_plan(plan);
-        }
-        free_bounded_two_row_projection_analysis(analysis);
-
-        if (profile_rules) {
-          throw_if_cuda_error(
-              cudaDeviceSynchronize(),
-              "profile bootstrap bounded two-row projection synchronize");
-          const std::chrono::duration<double> elapsed =
-              std::chrono::steady_clock::now() - phase_start;
-          std::cerr << ">>> [GPU Presolve C++ profile]"
-                    << " phase=bootstrap_bounded_two_row_projection"
-                    << " changed="
-                    << (changed_projection ? "true" : "false")
-                    << " dims=(" << m_before << "," << n_before << ")->("
-                    << current.lp.A.rows << "," << current.lp.A.cols << ")"
-                    << " nnz=" << nnz_before << "->" << current.lp.A.nnz
-                    << " time=" << elapsed.count() << "s\n";
-        }
-      }
-
-      if (!terminal && !time_exceeded() &&
-          params.enable_orphan_mccormick_projection) {
-        const std::int32_t m_before = current.lp.A.rows;
-        const std::int32_t n_before = current.lp.A.cols;
-        const std::int32_t nnz_before = current.lp.A.nnz;
-        const auto phase_start = std::chrono::steady_clock::now();
-        OrphanMcCormickProjectionAnalysisGpu analysis =
-            analyze_orphan_mccormick_projection(current.lp, params);
-        bool changed_projection = false;
-        if (analysis.applicable) {
-          PresolvePlanGpu plan;
-          allocate_plan(plan, current.lp,
-                        PlanRequirements{/*objective=*/false,
-                                         /*col_bounds=*/false,
-                                         /*row_bounds=*/false});
-          build_orphan_mccormick_projection_plan(plan, current.lp, analysis,
-                                                 params);
-          changed_projection = plan.has_change;
-          if (changed_projection) {
-            apply_plan_to_working_lp(current, plan, &summary.record);
-            invalidate_column_singleton_clean();
-          }
-          free_plan(plan);
-        }
-        free_orphan_mccormick_projection_analysis(analysis);
-
-        if (profile_rules) {
-          throw_if_cuda_error(
-              cudaDeviceSynchronize(),
-              "profile bootstrap orphan McCormick projection synchronize");
-          const std::chrono::duration<double> elapsed =
-              std::chrono::steady_clock::now() - phase_start;
-          std::cerr << ">>> [GPU Presolve C++ profile]"
-                    << " phase=bootstrap_orphan_mccormick_projection"
-                    << " changed="
-                    << (changed_projection ? "true" : "false")
-                    << " dims=(" << m_before << "," << n_before << ")->("
-                    << current.lp.A.rows << "," << current.lp.A.cols << ")"
-                    << " nnz=" << nnz_before << "->" << current.lp.A.nnz
-                    << " time=" << elapsed.count() << "s\n";
-        }
-      }
-
-      const bool changed_structural_before =
-          run_col_phase(false, false, false, false, false, true, false, false, false);
-
-      if (changed_structural_before) {
-        run_cleanup();
-      }
-      bool changed_generic_bootstrap = false;
-      changed_generic_bootstrap = run_row_phase(true, false, false, false, false) || changed_generic_bootstrap;
-      changed_generic_bootstrap = run_row_phase(false, true, false, false, false) || changed_generic_bootstrap;
-      changed_generic_bootstrap = run_row_phase(false, false, true, false, false) || changed_generic_bootstrap;
-      changed_generic_bootstrap = run_row_phase(false, false, false, false, true) || changed_generic_bootstrap;
-
-      bool changed_rule = run_col_phase(true, true, false, false, false, false, false, false, false);
-      changed_generic_bootstrap = changed_rule || changed_generic_bootstrap;
-      if (changed_rule) {
-        changed_generic_bootstrap = run_trivial_cleanup_recirculation() || changed_generic_bootstrap;
-      }
-
-      changed_generic_bootstrap = run_col_phase(false, true, false, false, false, false, false, false, false) ||
-                                  changed_generic_bootstrap;
-
-      do {
-        changed_rule = run_col_phase(false, false, true, false, false, false, false, false, false);
-        changed_generic_bootstrap = changed_rule || changed_generic_bootstrap;
-        if (changed_rule) {
-          changed_generic_bootstrap = run_trivial_cleanup_recirculation() || changed_generic_bootstrap;
-        }
-      } while (changed_rule && !terminal && !time_exceeded());
-
-      do {
-        changed_rule = run_col_phase(false, false, false, true, false, false, false, false, false);
-        changed_generic_bootstrap = changed_rule || changed_generic_bootstrap;
-        if (changed_rule) {
-          changed_generic_bootstrap = run_trivial_cleanup_recirculation() || changed_generic_bootstrap;
-        }
-      } while (changed_rule && !terminal && !time_exceeded());
-
-      changed_rule = run_col_phase(false, false, false, false, false, false, true, false, false);
-      changed_generic_bootstrap = changed_rule || changed_generic_bootstrap;
-      if (changed_rule) {
-        changed_generic_bootstrap = run_trivial_cleanup_recirculation() || changed_generic_bootstrap;
-      }
-
-      changed_rule = run_col_phase(false, false, false, false, false, false, false, true, false);
-      changed_generic_bootstrap = changed_rule || changed_generic_bootstrap;
-      if (changed_rule) {
-        changed_generic_bootstrap = run_trivial_cleanup_recirculation() || changed_generic_bootstrap;
-      }
-
-      if (changed_generic_bootstrap) {
-        const bool changed_structural_after =
-            run_col_phase(false, false, false, false, false, true, false, false, false);
-
-        if (changed_structural_after) {
-          run_cleanup();
-        }
-      }
       ++summary.iterations;
     }
-
-    // Run tiered cycles after bootstrap whether or not it changed the model.
-    // The iteration count already includes any completed bootstrap pass.
-    bool fast_phase = true;
-    std::int32_t cycle_nnz_before = current.lp.A.nnz;
-    constexpr double progress_ratio = 0.95;
-    for (int iter = summary.iterations;
-         iter < params.max_iters && !terminal && !time_exceeded();
-         ++iter) {
-      bool changed_iter = false;
-      changed_iter = run_cleanup() || changed_iter;
-      const std::int32_t nnz_before_phase = current.lp.A.nnz;
-      if (fast_phase) {
-        changed_iter = run_fast_phase() || changed_iter;
-        const bool productive = _has_good_nnz_progress(nnz_before_phase, current.lp.A.nnz, progress_ratio);
-        fast_phase = productive;
-      } else {
-        changed_iter = run_medium_phase() || changed_iter;
-        const bool productive = _has_good_nnz_progress(cycle_nnz_before, current.lp.A.nnz, progress_ratio);
-        if (!changed_iter || !productive) {
-          ++summary.iterations;
-          break;
-        }
-        cycle_nnz_before = current.lp.A.nnz;
-        fast_phase = true;
-      }
-      ++summary.iterations;
-      if (!changed_iter && fast_phase) {
-        break;
-      }
+    // Refresh this reference on every execution, including consecutive Cleanup.
+    const NnzOffset stage_nnz_before = live_nnz();
+    if (phase == SchedulePhase::Cleanup) {
+      cleanup_phase(stage_nnz_before);
+    } else if (phase == SchedulePhase::Propagation) {
+      const auto deletion_serial_before = deletion_serial;
+      const bool bounds_changed = propagation();
+      const bool deleted_rows_or_cols = deletion_serial != deletion_serial_before;
+      bound_only_rounds = deleted_rows_or_cols ? 0 : bound_only_rounds + 1;
+      materialize("1");
+      const auto nnz_after = live_nnz();
+      const bool nnz_progress = has_good_nnz_progress(stage_nnz_before, nnz_after, minimum_nnz_decrease);
+      const bool bound_progress = bounds_changed && bound_only_rounds < bound_only_limit;
+      phase = nnz_progress || bound_progress
+          ? SchedulePhase::Cleanup : SchedulePhase::Aggregation;
+      if (profile_rules) std::cerr << ">>> [schedule-progress] phase=propagation stage_before=" << stage_nnz_before
+          << " after=" << nnz_after << " next=" << phase_name(phase)
+          << " pending=" << deferred.pending
+          << " bounds_changed=" << bounds_changed << " deleted=" << deleted_rows_or_cols
+          << " bound_only_rounds=" << bound_only_rounds << " limit=" << bound_only_limit
+          << " nnz_progress=" << nnz_progress << " bound_progress=" << bound_progress << '\n';
+      if (phase == SchedulePhase::Aggregation) bound_only_rounds = 0;
+    } else if (phase == SchedulePhase::Aggregation) {
+      if (profile_rules) std::cerr << ">>> [schedule-phase] phase=aggregation\n";
+      if (profile_rules) std::cerr << ">>> [schedule-phase] phase=doubleton_equations\n";
+      // Invoke the rule once; it processes one independent batch.
+      run_materialized_rule(params.enable_doubleton_equations, "doubleton_equations",
+                            apply_rule_doubleton_equations);
+      const auto nnz_after = live_nnz();
+      phase = has_good_nnz_progress(stage_nnz_before, nnz_after, minimum_nnz_decrease)
+          ? SchedulePhase::Cleanup : SchedulePhase::Parallel;
+      if (profile_rules) std::cerr << ">>> [schedule-progress] phase=aggregation stage_before=" << stage_nnz_before
+          << " after=" << nnz_after
+          << " next=" << phase_name(phase)
+          << " pending=" << deferred.pending << '\n';
+    } else {
+      if (profile_rules) std::cerr << ">>> [schedule-phase] phase=parallel\n";
+      bool changed = deferred_rule(params.enable_parallel_rows, "parallel_rows",
+          [&](auto& p, const auto& s) { apply_rule_parallel_rows(p, current.lp, s, params); });
+      changed = deferred_rule(params.enable_parallel_columns, "parallel_columns",
+          [&](auto& p, const auto& s) { apply_rule_parallel_columns(p, current.lp, s, params); }) || changed;
+      materialize("2");
+      // Count only reductions made by the two Parallel rules.
+      const auto nnz_after = live_nnz();
+      const bool continue_loop = changed &&
+          has_good_nnz_progress(stage_nnz_before, nnz_after, minimum_nnz_decrease);
+      if (profile_rules) std::cerr << ">>> [schedule-progress] phase=parallel stage_before=" << stage_nnz_before
+          << " after=" << nnz_after << " next=" << (continue_loop ? "cleanup" : "end")
+          << " pending=" << deferred.pending << '\n';
+      if (!continue_loop) break;
+      phase = SchedulePhase::Cleanup;
     }
   }
+  // A time/iteration limit can interrupt deferred work before its next Apply.
+  // Drain successful pending work so the returned LP and recovery maps agree.
+  materialize("finalize");
+  write_diagnostic_snapshot("final", current.lp);
 
-  if (!terminal && !time_exceeded() &&
-      (params.enable_redundant_bounds ||
-       params.enable_zero_cost_redundant_box_bounds)) {
-    (void)run_col_phase(false, false, false, false, false, false, false, false, true);
+  if (profile_live_stats) {
+    std::cerr << ">>> [live-structure] full_refreshes=" << full_stats_refreshes
+              << " incremental_updates=" << incremental_stats_updates << '\n';
   }
 
+  if (summary.record.device && runtime::options().recovery_stats) {
+    const auto &d = *summary.record.device;
+    std::cerr << ">>> [device-recovery] segments=" << d.segments.size() << " records=" << d.records
+              << " indices=" << d.indices << " values=" << d.values
+              << " host_staged_bytes=" << d.host_staged_bytes << "\n";
+  }
+  // Canonicalization is part of presolve timing, including terminal exits.
+  tape_chunks.finish(summary.record.tape);
   if (summary.record.tape_gpu.record_count != 0 ||
       summary.record.tape_gpu.index_count != 0 ||
       summary.record.tape_gpu.value_count != 0) {
     throw std::runtime_error(
         "GPU postsolve tape must remain deferred during presolve");
   }
-  // Defer tape upload to postsolve_gpu, after the reduced solve.
+  // Uploading the canonical tape is a postsolve concern.  postsolve_gpu owns
+  // the lazy upload path, so presolve does not wait on a transfer that cannot
+  // be consumed until after the reduced solve has finished.
   throw_if_cuda_error(cudaDeviceSynchronize(), "run_gpu_presolve_impl synchronize");
   summary.reduced_rows = current.lp.A.rows;
   summary.reduced_cols = current.lp.A.cols;
@@ -3384,11 +2626,14 @@ GpuPresolveSummary run_gpu_presolve_impl(const LPInfoGpu& lp,
   summary.record.m1 = summary.reduced_rows;
   summary.record.n1 = summary.reduced_cols;
   summary.record.obj_constant_new = current.lp.obj_constant;
-  rebuild_org2red(summary.record.row_org2red, summary.record.row_red2org, summary.record.m0);
-  rebuild_org2red(summary.record.col_org2red, summary.record.col_red2org, summary.record.n0);
+  if (!summary.record.device) {
+    rebuild_org2red(summary.record.row_org2red, summary.record.row_red2org, summary.record.m0);
+    rebuild_org2red(summary.record.col_org2red, summary.record.col_red2org, summary.record.n0);
+  }
   const std::chrono::duration<double> presolve_elapsed =
       std::chrono::steady_clock::now() - presolve_start;
   summary.elapsed_seconds = presolve_elapsed.count();
+  summary.has_change = current.owns;
   if (keep_reduced_lp) {
     summary.reduced_lp = current.lp;
     summary.owns_reduced_lp = current.owns;
@@ -3404,41 +2649,6 @@ GpuPresolveSummary run_gpu_presolve_impl(const LPInfoGpu& lp,
 GpuPresolveSummary run_gpu_presolve_with_record(const LPInfoGpu& lp,
                                                 const PresolveParams& params) {
   return run_gpu_presolve_impl(lp, params, false);
-}
-
-GpuPresolveSummary::GpuPresolveSummary(GpuPresolveSummary&& other) noexcept
-    : original_rows(std::exchange(other.original_rows, 0)),
-      original_cols(std::exchange(other.original_cols, 0)),
-      reduced_rows(std::exchange(other.reduced_rows, 0)),
-      reduced_cols(std::exchange(other.reduced_cols, 0)),
-      reduced_nnz(std::exchange(other.reduced_nnz, 0)),
-      iterations(std::exchange(other.iterations, 0)),
-      elapsed_seconds(std::exchange(other.elapsed_seconds, 0.0)),
-      obj_constant_delta(std::exchange(other.obj_constant_delta, 0.0)),
-      has_infeasible(std::exchange(other.has_infeasible, false)),
-      has_unbounded(std::exchange(other.has_unbounded, false)),
-      record(std::move(other.record)),
-      reduced_lp(std::exchange(other.reduced_lp, LPInfoGpu{})),
-      owns_reduced_lp(std::exchange(other.owns_reduced_lp, false)) {}
-
-GpuPresolveSummary& GpuPresolveSummary::operator=(GpuPresolveSummary&& other) noexcept {
-  if (this != &other) {
-    free_gpu_presolve_reduced_lp(*this);
-    original_rows = std::exchange(other.original_rows, 0);
-    original_cols = std::exchange(other.original_cols, 0);
-    reduced_rows = std::exchange(other.reduced_rows, 0);
-    reduced_cols = std::exchange(other.reduced_cols, 0);
-    reduced_nnz = std::exchange(other.reduced_nnz, 0);
-    iterations = std::exchange(other.iterations, 0);
-    elapsed_seconds = std::exchange(other.elapsed_seconds, 0.0);
-    obj_constant_delta = std::exchange(other.obj_constant_delta, 0.0);
-    has_infeasible = std::exchange(other.has_infeasible, false);
-    has_unbounded = std::exchange(other.has_unbounded, false);
-    record = std::move(other.record);
-    reduced_lp = std::exchange(other.reduced_lp, LPInfoGpu{});
-    owns_reduced_lp = std::exchange(other.owns_reduced_lp, false);
-  }
-  return *this;
 }
 
 GpuPresolveSummary run_gpu_presolve_with_reduced_lp(const LPInfoGpu& lp,

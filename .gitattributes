@@ -1,12 +1,12 @@
-# Keep development state and generated files out of git archive releases.
+# Keep local development files out of source archives.
 /.gitattributes export-ignore
 /.gitignore export-ignore
 /.codex export-ignore
 /.sync-tools export-ignore
+/build* export-ignore
+/cmake-build* export-ignore
+/cpp/build* export-ignore
+/cpp/cmake-build* export-ignore
 /reports export-ignore
-/build export-ignore
-/build-* export-ignore
-/cmake-build-* export-ignore
-/cpp/build export-ignore
-/cpp/build-* export-ignore
-/cpp/cmake-build-* export-ignore
+/results export-ignore
+/artifacts export-ignore

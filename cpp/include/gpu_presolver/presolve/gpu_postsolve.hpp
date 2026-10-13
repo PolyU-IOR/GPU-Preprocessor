@@ -6,11 +6,11 @@
 
 namespace gpu_presolver::presolve {
 
-// Structural-only convenience helper.  Use postsolve_gpu for any record that
+// Absolute-value epigraph recovery helper.  Use postsolve_gpu for any record that
 // may contain ordinary tape entries or interleaved primal-recovery checkpoints.
-void postsolve_restore_structural_primal_gpu(
+void postsolve_restore_absolute_value_epigraph_gpu(
     double* x_org,
-    const std::vector<StructuralL1PrimalRecoveryStep>& recoveries,
+    const std::vector<AbsoluteValueEpigraphPrimalRecoveryStep>& recoveries,
     const double* original_l = nullptr);
 
 GpuPostsolveResult postsolve_gpu(double* x_red,

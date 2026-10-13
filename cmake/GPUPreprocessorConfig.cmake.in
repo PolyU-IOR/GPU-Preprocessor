@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit 12)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/GPUPreprocessorTargets.cmake")
+if(NOT TARGET GPUPresolverC::core)
+  add_library(GPUPresolverC::core ALIAS GPUPreprocessor::core)
+endif()
+check_required_components(GPUPreprocessor)

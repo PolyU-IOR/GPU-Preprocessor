@@ -1,14 +1,18 @@
-#include "../presolve_helpers.hpp"
+#include "gpu_presolver/detail/runtime_options.hpp"
+#include "gpu_presolver/offset.hpp"
+#include "gpu_presolver/presolve/device_recovery.hpp"
 #include "gpu_presolver/presolve/rules/rule_doubleton_equations.hpp"
 
+#include "doubleton_long_rows.cuh"
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#include "gpu_presolver/presolve/gpu_presolve_kernels.hpp"
 #include <cusparse.h>
 #include <thrust/device_ptr.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/sort.h>
 
-#include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <climits>
 #include <cstdlib>
@@ -21,20 +25,15 @@
 namespace gpu_presolver::presolve {
 namespace {
 
-using detail::throw_if_cuda_error;
-using detail::append_postsolve_record;
-
 constexpr int GPU_PRESOLVE_THREADS = 256;
 constexpr int DOUBLETON_EQUATION_BATCH_MATCHING_ROUNDS = 8;
-constexpr int DOUBLETON_EQUATION_BATCH_INNER_ROUNDS = 1024;
 constexpr double DOUBLETON_EQUATION_MAX_RATIO_PIVOT = 1.0e3;
 
-void throw_if_cusparse_error(cusparseStatus_t status, const char* context) {
-  if (status == CUSPARSE_STATUS_SUCCESS) {
+void throw_if_cuda_error(cudaError_t status, const char* context) {
+  if (status == cudaSuccess) {
     return;
   }
-  throw std::runtime_error(std::string(context) + ": cuSPARSE status " +
-                           std::to_string(static_cast<int>(status)));
+  throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
 }
 
 template <class T>
@@ -73,13 +72,17 @@ auto doubleton_thrust_policy() {
   return thrust::cuda::par_nosync(DoubletonThrustAsyncAllocator{}).on(nullptr);
 }
 
-bool env_enabled(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr) {
-    return false;
-  }
-  const std::string s(value);
-  return !(s.empty() || s == "0" || s == "false" || s == "FALSE" || s == "off" || s == "OFF");
+void append_postsolve_record(PostsolveTape& tape,
+                             PostsolveReductionType type,
+                             const std::vector<std::int32_t>& indices,
+                             const std::vector<double>& vals,
+                             PostsolveDualMode dual_mode) {
+  tape.types.push_back(static_cast<std::int32_t>(type));
+  tape.indices.insert(tape.indices.end(), indices.begin(), indices.end());
+  tape.vals.insert(tape.vals.end(), vals.begin(), vals.end());
+  tape.index_starts.push_back(static_cast<NnzOffset>(tape.indices.size()));
+  tape.value_starts.push_back(static_cast<NnzOffset>(tape.vals.size()));
+  tape.dual_modes.push_back(static_cast<std::uint8_t>(dual_mode));
 }
 
 template <class T>
@@ -96,13 +99,13 @@ std::vector<T> copy_device_vector(const T* device, std::int32_t count, const cha
 }
 
 __global__ void _kernel_doubleton_sort_csr_row_keys(unsigned long long* keys,
-                                                    const std::int32_t* row_ptr,
+                                                    const NnzOffset* row_ptr,
                                                     const std::int32_t* col_val,
                                                     std::int32_t rows) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t row = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (row < rows) {
     const unsigned long long row_key = static_cast<unsigned long long>(static_cast<std::uint32_t>(row)) << 32;
-    for (std::int32_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
+    for (NnzOffset p = row_ptr[row]; p < row_ptr[row + 1]; ++p) {
       keys[p] = row_key | static_cast<unsigned long long>(static_cast<std::uint32_t>(col_val[p]));
     }
   }
@@ -110,14 +113,15 @@ __global__ void _kernel_doubleton_sort_csr_row_keys(unsigned long long* keys,
 
 __global__ void _kernel_doubleton_unpack_csr_row_keys(std::int32_t* col_val,
                                                       const unsigned long long* keys,
-                                                      std::int32_t nnz) {
-  const std::int32_t p = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+                                                      NnzOffset nnz) {
+  const NnzOffset p = static_cast<NnzOffset>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (p < nnz) {
     col_val[p] = static_cast<std::int32_t>(keys[p] & 0xffffffffULL);
   }
 }
 
 void sort_csr_rows_by_col_thrust(DeviceCsrMatrix& matrix, const char* context) {
+  if (csr_rows_strictly_sorted(matrix)) return;
   if (matrix.nnz <= 0) {
     return;
   }
@@ -206,15 +210,15 @@ __device__ void _choose_doubleton_equations_columns(std::int32_t col1,
   }
 }
 
-__device__ std::int32_t _doubleton_equations_fill_in_proxy_device(const std::int32_t* row_ptr,
+__device__ std::int32_t _doubleton_equations_fill_in_proxy_device(const NnzOffset* row_ptr,
                                                            const std::int32_t* col_val,
                                                            std::int32_t keep_col,
                                                            std::int32_t elim_col) {
   std::int32_t fill_in = -1;
-  std::int32_t jj = row_ptr[keep_col];
-  const std::int32_t keep_stop = row_ptr[keep_col + 1];
-  std::int32_t kk = row_ptr[elim_col];
-  const std::int32_t elim_stop = row_ptr[elim_col + 1];
+  NnzOffset jj = row_ptr[keep_col];
+  const NnzOffset keep_stop = row_ptr[keep_col + 1];
+  NnzOffset kk = row_ptr[elim_col];
+  const NnzOffset elim_stop = row_ptr[elim_col + 1];
   if (keep_stop <= jj || elim_stop <= kk) {
     return fill_in;
   }
@@ -236,23 +240,23 @@ __device__ std::int32_t _doubleton_equations_fill_in_proxy_device(const std::int
 }
 
 __global__ void _kernel_doubleton_equations_live_col_nnz(std::int32_t* col_nnz,
-                                                  const std::int32_t* AT_row_ptr,
+                                                  const NnzOffset* AT_row_ptr,
                                                   const std::int32_t* AT_col_val,
                                                   const double* AT_nz_val,
                                                   const std::uint8_t* keep_row,
                                                   const std::uint8_t* keep_col,
                                                   double zero_tol,
                                                   std::int32_t n) {
-  const std::int32_t col = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t col = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (col < n) {
     if (keep_col[col] == std::uint8_t{0}) {
       col_nnz[col] = 0;
       return;
     }
     std::int32_t count = 0;
-    const std::int32_t start_idx = AT_row_ptr[col];
-    const std::int32_t stop_idx = AT_row_ptr[col + 1];
-    for (std::int32_t p = start_idx; p < stop_idx; ++p) {
+    const NnzOffset start_idx = AT_row_ptr[col];
+    const NnzOffset stop_idx = AT_row_ptr[col + 1];
+    for (NnzOffset p = start_idx; p < stop_idx; ++p) {
       const std::int32_t row = AT_col_val[p];
       const double a = AT_nz_val[p];
       if (keep_row[row] != std::uint8_t{0} && fabs(a) > zero_tol) {
@@ -266,7 +270,7 @@ __global__ void _kernel_doubleton_equations_live_col_nnz(std::int32_t* col_nnz,
 __global__ void _kernel_select_doubleton_equations_target_row_direct(std::int32_t* target_row_ref,
                                                               std::int32_t* target_meta_i32,
                                                               double* target_meta_f64,
-                                                              const std::int32_t* row_ptr,
+                                                              const NnzOffset* row_ptr,
                                                               const std::int32_t* col_val,
                                                               const double* nz_val,
                                                               const std::uint8_t* keep_row,
@@ -277,28 +281,28 @@ __global__ void _kernel_select_doubleton_equations_target_row_direct(std::int32_
                                                               const double* l,
                                                               const double* u,
                                                               const double* c,
-                                                              const std::int32_t* AT_row_ptr,
+                                                              const NnzOffset* AT_row_ptr,
                                                               const std::int32_t* AT_col_val,
                                                               double zero_tol,
                                                               double tol,
                                                               double ratio_tol,
                                                               std::int32_t max_fill_in_proxy,
                                                               std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < m && keep_row[i] != std::uint8_t{0}) {
     const double lhs = AL[i];
     const double rhs = AU[i];
     if (!isfinite(lhs) || !isfinite(rhs) || fabs(lhs - rhs) > tol) {
       return;
     }
-    const std::int32_t row_start = row_ptr[i];
-    const std::int32_t row_stop = row_ptr[i + 1];
+    const NnzOffset row_start = row_ptr[i];
+    const NnzOffset row_stop = row_ptr[i + 1];
     std::int32_t live_count = 0;
     std::int32_t col1 = -1;
     std::int32_t col2 = -1;
     double val1 = 0.0;
     double val2 = 0.0;
-    for (std::int32_t p = row_start; p < row_stop; ++p) {
+    for (NnzOffset p = row_start; p < row_stop; ++p) {
       const std::int32_t col_j = col_val[p];
       const double a = nz_val[p];
       if (keep_col_mask[col_j] != std::uint8_t{0} && fabs(a) > zero_tol) {
@@ -366,7 +370,7 @@ __global__ void _kernel_doubleton_equations_apply(std::int32_t* status,
                                            double* obj_delta,
                                            const std::int32_t* meta_i32,
                                            const double* meta_f64,
-                                           const std::int32_t* AT_row_ptr,
+                                           const NnzOffset* AT_row_ptr,
                                            const std::int32_t* AT_col_val,
                                            const double* AT_nz_val,
                                            double bound_tol,
@@ -417,12 +421,12 @@ __global__ void _kernel_doubleton_equations_apply(std::int32_t* status,
     return;
   }
 
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t < m) {
     double shift = 0.0;
-    const std::int32_t start = AT_row_ptr[elim_col];
-    const std::int32_t stop = AT_row_ptr[elim_col + 1];
-    for (std::int32_t p = start; p < stop; ++p) {
+    const NnzOffset start = AT_row_ptr[elim_col];
+    const NnzOffset stop = AT_row_ptr[elim_col + 1];
+    for (NnzOffset p = start; p < stop; ++p) {
       if (AT_col_val[p] == t) {
         shift = AT_nz_val[p] * beta;
         break;
@@ -442,15 +446,15 @@ __global__ void _kernel_doubleton_equations_apply(std::int32_t* status,
   }
 }
 
-__global__ void _kernel_doubleton_equations_row_counts(std::int32_t* row_nnz_new,
-                                                const std::int32_t* row_ptr,
+__global__ void _kernel_doubleton_equations_row_counts(NnzOffset* row_nnz_new,
+                                                const NnzOffset* row_ptr,
                                                 const std::int32_t* col_val,
                                                 const double* nz_val,
                                                 const std::int32_t* meta_i32,
                                                 const double* meta_f64,
                                                 double zero_tol,
                                                 std::int32_t m) {
-  const std::int32_t r = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t r = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (r >= m) {
     return;
   }
@@ -459,9 +463,9 @@ __global__ void _kernel_doubleton_equations_row_counts(std::int32_t* row_nnz_new
   const std::int32_t keep_col = meta_i32[2];
   const double alpha = -meta_f64[1] / meta_f64[0];
 
-  const std::int32_t first = row_ptr[r];
-  const std::int32_t last = row_ptr[r + 1];
-  std::int32_t len = last - first;
+  const NnzOffset first = row_ptr[r];
+  const NnzOffset last = row_ptr[r + 1];
+  NnzOffset len = last - first;
   if (r == target_row) {
     row_nnz_new[r] = len;
     return;
@@ -471,7 +475,7 @@ __global__ void _kernel_doubleton_equations_row_counts(std::int32_t* row_nnz_new
   bool keep_present = false;
   double are = 0.0;
   double old_keep = 0.0;
-  for (std::int32_t p = first; p < last; ++p) {
+  for (NnzOffset p = first; p < last; ++p) {
     const std::int32_t col = col_val[p];
     const double val = nz_val[p];
     if (col == elim_col) {
@@ -492,10 +496,10 @@ __global__ void _kernel_doubleton_equations_row_counts(std::int32_t* row_nnz_new
   row_nnz_new[r] = len > 0 ? len : 0;
 }
 
-__global__ void _kernel_row_ptr_from_prefix(std::int32_t* row_ptr,
-                                            const std::int32_t* prefix,
+__global__ void _kernel_row_ptr_from_prefix(NnzOffset* row_ptr,
+                                            const NnzOffset* prefix,
                                             std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i == 0) {
     row_ptr[0] = 0;
   }
@@ -504,7 +508,8 @@ __global__ void _kernel_row_ptr_from_prefix(std::int32_t* row_ptr,
   }
 }
 
-void inclusive_scan_i32(std::int32_t* values, std::int32_t n, const char* context) {
+template <typename T>
+void inclusive_scan_i32(T* values, std::int32_t n, const char* context) {
   if (n <= 0) {
     return;
   }
@@ -521,14 +526,14 @@ void inclusive_scan_i32(std::int32_t* values, std::int32_t n, const char* contex
 }
 
 __global__ void _kernel_fill_i32(std::int32_t* data, std::int32_t value, std::int32_t n) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < n) {
     data[i] = value;
   }
 }
 
 __global__ void _kernel_u8_to_i32(std::int32_t* out, const std::uint8_t* in, std::int32_t n) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < n) {
     out[i] = in[i] != std::uint8_t{0} ? 1 : 0;
   }
@@ -538,7 +543,7 @@ __global__ void _kernel_scatter_mask_indices(std::int32_t* indices,
                                              const std::uint8_t* mask,
                                              const std::int32_t* prefix,
                                              std::int32_t n) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < n && mask[i] != std::uint8_t{0}) {
     indices[prefix[i] - 1] = i;
   }
@@ -559,6 +564,12 @@ struct DoubletonBatchTapeRecord {
   double new_keep_u;
   double old_elim_c;
 };
+
+__global__ void capture_scalar_recovery(DoubletonBatchTapeRecord *out, const int *ids,
+                                        const double *v, const double *l, const double *u) {
+  *out = DoubletonBatchTapeRecord{ids[1], ids[2], ids[0], v[0],      v[1],      v[2], v[3],
+                                  v[4],   v[6],   v[7],   l[ids[2]], u[ids[2]], v[5]};
+}
 
 struct DoubletonBatchTapeBuffer {
   DoubletonBatchTapeRecord* records = nullptr;
@@ -654,6 +665,105 @@ void append_doubleton_batch_tape_records(
   }
 }
 
+__global__ void _kernel_build_doubleton_postsolve_tape_gpu(
+    std::int32_t* types,
+    NnzOffset* index_starts,
+    NnzOffset* value_starts,
+    std::uint8_t* dual_modes,
+    std::int32_t* indices,
+    double* vals,
+    const DoubletonBatchTapeRecord* records,
+    std::int32_t count) {
+  const std::int32_t i =
+      static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
+  if (i > count) {
+    return;
+  }
+  index_starts[i] = 4 * i;
+  value_starts[i] = 12 * i;
+  if (i == count) {
+    return;
+  }
+
+  const DoubletonBatchTapeRecord record = records[i];
+  types[i] = static_cast<std::int32_t>(PostsolveReductionType::DoubletonEquation);
+  dual_modes[i] = static_cast<std::uint8_t>(PostsolveDualMode::Minimal);
+  const NnzOffset idx = 4 * i;
+  indices[idx] = record.elim_col;
+  indices[idx + 1] = record.keep_col;
+  indices[idx + 2] = record.row;
+  indices[idx + 3] = 0;
+  const std::int32_t val = 12 * i;
+  vals[val] = record.elim_val;
+  vals[val + 1] = record.keep_val;
+  vals[val + 2] = record.old_row_au;
+  vals[val + 3] = record.old_elim_l;
+  vals[val + 4] = record.old_elim_u;
+  vals[val + 5] = record.old_keep_l;
+  vals[val + 6] = record.old_keep_u;
+  vals[val + 7] = record.new_keep_l;
+  vals[val + 8] = record.new_keep_u;
+  vals[val + 9] = record.old_elim_c;
+  vals[val + 10] = 0.0;
+  vals[val + 11] = 0.0;
+}
+
+void build_doubleton_postsolve_tape_gpu(
+    PostsolveTapeGpu& tape,
+    const DoubletonBatchTapeRecord* records,
+    std::int32_t count) {
+  if (count <= 0) {
+    return;
+  }
+  if (count > INT_MAX / 12) {
+    throw std::runtime_error("doubleton GPU postsolve tape exceeds Int32 capacity");
+  }
+  tape.reset();
+  tape.record_count = count;
+  tape.index_count = 4 * count;
+  tape.value_count = 12 * count;
+  tape.record_capacity = count;
+  tape.index_capacity = tape.index_count;
+  tape.value_capacity = tape.value_count;
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(
+          &tape.types,
+          sizeof(std::int32_t) * static_cast<std::size_t>(count)),
+      "cudaMalloc doubleton GPU tape types");
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(
+          &tape.index_starts,
+          sizeof(NnzOffset) * static_cast<std::size_t>(count + 1)),
+      "cudaMalloc doubleton GPU tape index starts");
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(
+          &tape.value_starts,
+          sizeof(NnzOffset) * static_cast<std::size_t>(count + 1)),
+      "cudaMalloc doubleton GPU tape value starts");
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(&tape.dual_modes, static_cast<std::size_t>(count)),
+      "cudaMalloc doubleton GPU tape dual modes");
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(
+          &tape.indices,
+          sizeof(std::int32_t) *
+              static_cast<std::size_t>(tape.index_count)),
+      "cudaMalloc doubleton GPU tape indices");
+  throw_if_cuda_error(
+      doubleton_cuda_malloc(
+          &tape.vals,
+          sizeof(double) * static_cast<std::size_t>(tape.value_count)),
+      "cudaMalloc doubleton GPU tape values");
+  const int blocks =
+      (count + 1 + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
+  _kernel_build_doubleton_postsolve_tape_gpu<<<blocks,
+                                               GPU_PRESOLVE_THREADS>>>(
+      tape.types, tape.index_starts, tape.value_starts, tape.dual_modes,
+      tape.indices, tape.vals, records, count);
+  throw_if_cuda_error(cudaGetLastError(),
+                      "_kernel_build_doubleton_postsolve_tape_gpu");
+}
+
 __global__ void _kernel_capture_doubleton_batch_tape(
     DoubletonBatchTapeRecord* records,
     const std::int32_t* selected_rows,
@@ -667,7 +777,7 @@ __global__ void _kernel_capture_doubleton_batch_tape(
     const double* au,
     std::int32_t selected_count) {
   const std::int32_t i =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+      static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i >= selected_count) {
     return;
   }
@@ -698,7 +808,7 @@ __global__ void _kernel_pack_doubleton_batch_tape(
     const double* u,
     std::int32_t selected_count) {
   const std::int32_t i =
-      static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+      static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i >= selected_count || subst_pair_mask[i] == std::uint8_t{0}) {
     return;
   }
@@ -708,14 +818,14 @@ __global__ void _kernel_pack_doubleton_batch_tape(
   packed_records[prefix[i] - 1] = record;
 }
 
-__device__ std::int32_t _doubleton_equations_next_live_col_row(const std::int32_t* row_ptr,
+__device__ std::int32_t _doubleton_equations_next_live_col_row(const NnzOffset* row_ptr,
                                                         const std::int32_t* col_val,
                                                         const double* nz_val,
                                                         const std::uint8_t* keep_row,
                                                         double zero_tol,
                                                         std::int32_t col,
                                                         std::int32_t* pos) {
-  const std::int32_t stop = row_ptr[col + 1];
+  const NnzOffset stop = row_ptr[col + 1];
   while (*pos < stop) {
     const std::int32_t row = col_val[*pos];
     const double val = nz_val[*pos];
@@ -727,7 +837,7 @@ __device__ std::int32_t _doubleton_equations_next_live_col_row(const std::int32_
   return INT_MAX;
 }
 
-__device__ std::int32_t _doubleton_equations_fill_in_proxy_device_live(const std::int32_t* row_ptr,
+__device__ std::int32_t _doubleton_equations_fill_in_proxy_device_live(const NnzOffset* row_ptr,
                                                                 const std::int32_t* col_val,
                                                                 const double* nz_val,
                                                                 const std::uint8_t* keep_row,
@@ -735,10 +845,10 @@ __device__ std::int32_t _doubleton_equations_fill_in_proxy_device_live(const std
                                                                 std::int32_t keep_col,
                                                                 std::int32_t elim_col) {
   std::int32_t fill_in = -1;
-  std::int32_t jj = row_ptr[keep_col];
-  const std::int32_t keep_stop = row_ptr[keep_col + 1];
-  std::int32_t kk = row_ptr[elim_col];
-  const std::int32_t elim_stop = row_ptr[elim_col + 1];
+  NnzOffset jj = row_ptr[keep_col];
+  const NnzOffset keep_stop = row_ptr[keep_col + 1];
+  NnzOffset kk = row_ptr[elim_col];
+  const NnzOffset elim_stop = row_ptr[elim_col + 1];
   if (keep_stop <= jj || elim_stop <= kk) {
     return fill_in;
   }
@@ -781,7 +891,7 @@ __global__ void _kernel_doubleton_equations_candidates(std::uint8_t* candidate_m
                                                 double* candidate_elim_val,
                                                 std::int32_t* candidate_keep_col,
                                                 double* candidate_keep_val,
-                                                const std::int32_t* row_ptr,
+                                                const NnzOffset* row_ptr,
                                                 const std::int32_t* col_val,
                                                 const double* nz_val,
                                                 const std::uint8_t* keep_row,
@@ -793,7 +903,7 @@ __global__ void _kernel_doubleton_equations_candidates(std::uint8_t* candidate_m
                                                 double tol,
                                                 double ratio_tol,
                                                 std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i >= m || keep_row[i] == std::uint8_t{0}) {
     return;
   }
@@ -808,7 +918,7 @@ __global__ void _kernel_doubleton_equations_candidates(std::uint8_t* candidate_m
   std::int32_t col2 = -1;
   double val1 = 0.0;
   double val2 = 0.0;
-  for (std::int32_t p = row_ptr[i]; p < row_ptr[i + 1]; ++p) {
+  for (NnzOffset p = row_ptr[i]; p < row_ptr[i + 1]; ++p) {
     const std::int32_t col = col_val[p];
     const double val = nz_val[p];
     if (keep_col_mask[col] != std::uint8_t{0} && fabs(val) > zero_tol) {
@@ -849,14 +959,14 @@ __global__ void _kernel_mark_doubleton_equations_batch_acceptable(std::uint8_t* 
                                                            const std::int32_t* candidate_keep_col,
                                                            const std::int32_t* candidate_elim_col,
                                                            const std::int32_t* col_nnz,
-                                                           const std::int32_t* AT_row_ptr,
+                                                           const NnzOffset* AT_row_ptr,
                                                            const std::int32_t* AT_col_val,
                                                            const double* AT_nz_val,
                                                            const std::uint8_t* keep_row,
                                                            double zero_tol,
                                                            std::int32_t max_fill_in_proxy,
                                                            std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < m && candidate_mask[i] != std::uint8_t{0}) {
     const std::int32_t keep_col = candidate_keep_col[i];
     const std::int32_t elim_col = candidate_elim_col[i];
@@ -879,7 +989,7 @@ __global__ void _kernel_claim_doubleton_equations_batch_columns(std::int32_t* co
                                                          const std::int32_t* candidate_keep_col,
                                                          const std::int32_t* candidate_elim_col,
                                                          std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < m && active_mask[i] != std::uint8_t{0}) {
     const std::int32_t keep_col = candidate_keep_col[i];
     const std::int32_t elim_col = candidate_elim_col[i];
@@ -897,7 +1007,7 @@ __global__ void _kernel_select_doubleton_equations_batch_rows(std::uint8_t* sele
                                                        const std::int32_t* candidate_elim_col,
                                                        const std::int32_t* col_owner,
                                                        std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < m && active_mask[i] != std::uint8_t{0}) {
     const std::int32_t keep_col = candidate_keep_col[i];
     const std::int32_t elim_col = candidate_elim_col[i];
@@ -931,7 +1041,7 @@ __global__ void _kernel_apply_doubleton_equations_batch(std::int32_t* status,
                                                  const std::int32_t* candidate_elim_col,
                                                  const double* candidate_keep_val,
                                                  const double* candidate_elim_val,
-                                                 const std::int32_t* AT_row_ptr,
+                                                 const NnzOffset* AT_row_ptr,
                                                  const std::int32_t* AT_col_val,
                                                  const double* AT_nz_val,
                                                  const double* old_l,
@@ -940,7 +1050,7 @@ __global__ void _kernel_apply_doubleton_equations_batch(std::int32_t* status,
                                                  const double* AU_old,
                                                  double bound_tol,
                                                  std::int32_t k) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t >= k) {
     return;
   }
@@ -1004,30 +1114,30 @@ __global__ void _kernel_apply_doubleton_equations_batch(std::int32_t* status,
 }
 
 __global__ void _kernel_apply_row_shift(double* AL, double* AU, const double* row_shift, std::int32_t m) {
-  const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t i = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (i < m) {
     AL[i] -= row_shift[i];
     AU[i] -= row_shift[i];
   }
 }
 
-__global__ void _kernel_doubleton_equations_batch_entry_counts(std::int32_t* entry_counts,
+__global__ void _kernel_doubleton_equations_batch_entry_counts(NnzOffset* entry_counts,
                                                         const std::int32_t* selected_rows,
                                                         const std::int32_t* candidate_elim_col,
-                                                        const std::int32_t* AT_row_ptr,
+                                                        const NnzOffset* AT_row_ptr,
                                                         const std::int32_t* AT_col_val,
                                                         const double* AT_nz_val,
                                                         const std::uint8_t* keep_row_mask,
                                                         double zero_tol,
                                                         std::int32_t k) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t >= k) {
     return;
   }
   const std::int32_t row = selected_rows[t];
   const std::int32_t elim = candidate_elim_col[row];
   std::int32_t count = 0;
-  for (std::int32_t p = AT_row_ptr[elim]; p < AT_row_ptr[elim + 1]; ++p) {
+  for (NnzOffset p = AT_row_ptr[elim]; p < AT_row_ptr[elim + 1]; ++p) {
     const std::int32_t support_row = AT_col_val[p];
     const double a = AT_nz_val[p];
     if (support_row != row && keep_row_mask[support_row] != std::uint8_t{0} && fabs(a) > zero_tol) {
@@ -1042,7 +1152,7 @@ __global__ void _kernel_scatter_selected_rows_by_pair_mask(std::int32_t* out_row
                                                            const std::uint8_t* pair_mask,
                                                            const std::int32_t* prefix,
                                                            std::int32_t k) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t < k && pair_mask[t] != std::uint8_t{0}) {
     out_rows[prefix[t] - 1] = selected_rows[t];
   }
@@ -1053,20 +1163,20 @@ __global__ void _kernel_accumulate_doubleton_equations_fixed_row_shift(double* r
                                                                 const std::uint8_t* fixed_pair_mask,
                                                                 const std::int32_t* candidate_keep_col,
                                                                 const double* fixed_values_by_col,
-                                                                const std::int32_t* AT_row_ptr,
+                                                                const NnzOffset* AT_row_ptr,
                                                                 const std::int32_t* AT_col_val,
                                                                 const double* AT_nz_val,
                                                                 const std::uint8_t* keep_row_mask,
                                                                 double zero_tol,
                                                                 std::int32_t k) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t >= k || fixed_pair_mask[t] == std::uint8_t{0}) {
     return;
   }
   const std::int32_t row = selected_rows[t];
   const std::int32_t keep = candidate_keep_col[row];
   const double fixed_at = fixed_values_by_col[keep];
-  for (std::int32_t p = AT_row_ptr[keep]; p < AT_row_ptr[keep + 1]; ++p) {
+  for (NnzOffset p = AT_row_ptr[keep]; p < AT_row_ptr[keep + 1]; ++p) {
     const std::int32_t support_row = AT_col_val[p];
     const double a = AT_nz_val[p];
     if (keep_row_mask[support_row] != std::uint8_t{0} && fabs(a) > zero_tol) {
@@ -1078,21 +1188,21 @@ __global__ void _kernel_accumulate_doubleton_equations_fixed_row_shift(double* r
 __global__ void _kernel_doubleton_equations_batch_build_delta(long long* delta_keys,
                                                        double* delta_vals,
                                                        double* row_shift,
-                                                       const std::int32_t* entry_starts,
+                                                       const NnzOffset* entry_starts,
                                                        const std::int32_t* selected_rows,
                                                        const std::int32_t* candidate_keep_col,
                                                        const std::int32_t* candidate_elim_col,
                                                        const double* candidate_keep_val,
                                                        const double* candidate_elim_val,
                                                        const double* AU_old,
-                                                       const std::int32_t* AT_row_ptr,
+                                                       const NnzOffset* AT_row_ptr,
                                                        const std::int32_t* AT_col_val,
                                                        const double* AT_nz_val,
                                                        const std::uint8_t* keep_row_mask,
                                                        double zero_tol,
                                                        std::int32_t n,
                                                        std::int32_t k) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t >= k) {
     return;
   }
@@ -1101,8 +1211,8 @@ __global__ void _kernel_doubleton_equations_batch_build_delta(long long* delta_k
   const std::int32_t elim = candidate_elim_col[row];
   const double alpha = -candidate_keep_val[row] / candidate_elim_val[row];
   const double beta = AU_old[row] / candidate_elim_val[row];
-  std::int32_t write = entry_starts[t];
-  for (std::int32_t p = AT_row_ptr[elim]; p < AT_row_ptr[elim + 1]; ++p) {
+  NnzOffset write = entry_starts[t];
+  for (NnzOffset p = AT_row_ptr[elim]; p < AT_row_ptr[elim + 1]; ++p) {
     const std::int32_t support_row = AT_col_val[p];
     const double a = AT_nz_val[p];
     if (support_row != row && keep_row_mask[support_row] != std::uint8_t{0} && fabs(a) > zero_tol) {
@@ -1115,38 +1225,43 @@ __global__ void _kernel_doubleton_equations_batch_build_delta(long long* delta_k
   }
 }
 
-__global__ void _kernel_delta_row_counts(std::int32_t* row_counts,
+__global__ void _kernel_delta_row_counts(NnzOffset* row_counts,
                                          const long long* delta_keys,
-                                         std::int32_t unique_count,
+                                         NnzOffset unique_count,
                                          std::int32_t n) {
-  const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t t = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (t < unique_count) {
     const std::int32_t row = static_cast<std::int32_t>(delta_keys[t] / static_cast<long long>(n));
     atomicAdd(&row_counts[row], 1);
   }
 }
 
-__global__ void _kernel_doubleton_equations_merged_row_counts(std::int32_t* row_nnz_new,
-                                                       const std::int32_t* row_ptr,
+__global__ void _kernel_doubleton_equations_merged_row_counts(NnzOffset* row_nnz_new,
+                                                       const NnzOffset* row_ptr,
                                                        const std::int32_t* col_val,
                                                        const double* nz_val,
-                                                       const std::int32_t* delta_row_ptr,
+                                                       const NnzOffset* delta_row_ptr,
                                                        const long long* delta_keys,
                                                        const double* delta_vals,
                                                        double zero_tol,
                                                        std::int32_t m,
-                                                       std::int32_t n) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+                                                       std::int32_t n, int long_threshold = 0,
+                                                       int* long_rows = nullptr, int* long_count = nullptr) {
+  const std::int32_t row = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (row >= m) {
     return;
   }
-  const std::int32_t p_start = row_ptr[row];
-  const std::int32_t p_stop = row_ptr[row + 1];
-  const std::int32_t q_start = delta_row_ptr[row];
-  const std::int32_t q_stop = delta_row_ptr[row + 1];
+  const NnzOffset p_start = row_ptr[row];
+  const NnzOffset p_stop = row_ptr[row + 1];
+  const NnzOffset q_start = delta_row_ptr[row];
+  const NnzOffset q_stop = delta_row_ptr[row + 1];
+  if (static_cast<std::int64_t>(p_stop - p_start) + (q_stop - q_start) >= long_threshold && long_rows != nullptr) {
+    long_rows[atomicAdd(long_count, 1)] = row;
+    return;
+  }
   std::int32_t count = 0;
-  std::int32_t p = p_start;
-  std::int32_t q = q_start;
+  NnzOffset p = p_start;
+  NnzOffset q = q_start;
   while (p < p_stop || q < q_stop) {
     const std::int32_t source_col = (p < p_stop) ? col_val[p] : INT_MAX;
     const std::int32_t delta_col =
@@ -1171,27 +1286,28 @@ __global__ void _kernel_doubleton_equations_merged_row_counts(std::int32_t* row_
 
 __global__ void _kernel_doubleton_equations_copy_merged_rows(std::int32_t* col_val_new,
                                                       double* nz_val_new,
-                                                      const std::int32_t* row_ptr_new,
-                                                      const std::int32_t* row_ptr,
+                                                      const NnzOffset* row_ptr_new,
+                                                      const NnzOffset* row_ptr,
                                                       const std::int32_t* col_val,
                                                       const double* nz_val,
-                                                      const std::int32_t* delta_row_ptr,
+                                                      const NnzOffset* delta_row_ptr,
                                                       const long long* delta_keys,
                                                       const double* delta_vals,
                                                       double zero_tol,
                                                       std::int32_t m,
-                                                      std::int32_t n) {
-  const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+                                                      std::int32_t n, int long_threshold = 0) {
+  const std::int32_t row = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (row >= m) {
     return;
   }
-  const std::int32_t p_start = row_ptr[row];
-  const std::int32_t p_stop = row_ptr[row + 1];
-  const std::int32_t q_start = delta_row_ptr[row];
-  const std::int32_t q_stop = delta_row_ptr[row + 1];
-  std::int32_t write = row_ptr_new[row];
-  std::int32_t p = p_start;
-  std::int32_t q = q_start;
+  const NnzOffset p_start = row_ptr[row];
+  const NnzOffset p_stop = row_ptr[row + 1];
+  const NnzOffset q_start = delta_row_ptr[row];
+  const NnzOffset q_stop = delta_row_ptr[row + 1];
+  if (long_threshold > 0 && static_cast<std::int64_t>(p_stop - p_start) + (q_stop - q_start) >= long_threshold) return;
+  NnzOffset write = row_ptr_new[row];
+  NnzOffset p = p_start;
+  NnzOffset q = q_start;
   while (p < p_stop || q < q_stop) {
     const std::int32_t source_col = (p < p_stop) ? col_val[p] : INT_MAX;
     const std::int32_t delta_col =
@@ -1234,30 +1350,36 @@ DeviceCsrMatrix build_doubleton_batch_new_A(const DeviceCsrMatrix& source,
   }
   const int blocks_selected = (selected_count + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
   const int blocks_rows = (source.rows + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
-  std::int32_t* entry_counts = nullptr;
-  std::int32_t* entry_prefix = nullptr;
-  std::int32_t* entry_starts = nullptr;
+  NnzOffset* entry_counts = nullptr;
+  NnzOffset* entry_prefix = nullptr;
+  NnzOffset* entry_starts = nullptr;
   long long* delta_keys = nullptr;
   double* delta_vals = nullptr;
-  std::int32_t* delta_row_counts = nullptr;
-  std::int32_t* delta_row_ptr = nullptr;
-  std::int32_t* row_counts_new = nullptr;
+  NnzOffset* delta_row_counts = nullptr;
+  NnzOffset* delta_row_ptr = nullptr;
+  NnzOffset* row_counts_new = nullptr;
+  // Keep the serial implementation available as a numerical/performance oracle.
+  const bool parallel_long_rows = runtime::options().doubleton_long_rows;
+  int* long_rows = nullptr;
+  int* long_count = nullptr;
+  NnzOffset* segment_counts = nullptr;
 
-  throw_if_cuda_error(doubleton_cuda_malloc(&entry_counts, sizeof(std::int32_t) * static_cast<std::size_t>(selected_count)),
+
+  throw_if_cuda_error(doubleton_cuda_malloc(&entry_counts, sizeof(NnzOffset) * static_cast<std::size_t>(selected_count)),
                       "cudaMalloc doubleton batch entry_counts");
-  throw_if_cuda_error(doubleton_cuda_malloc(&entry_prefix, sizeof(std::int32_t) * static_cast<std::size_t>(selected_count)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&entry_prefix, sizeof(NnzOffset) * static_cast<std::size_t>(selected_count)),
                       "cudaMalloc doubleton batch entry_prefix");
   _kernel_doubleton_equations_batch_entry_counts<<<blocks_selected, GPU_PRESOLVE_THREADS>>>(
       entry_counts, selected_rows, candidate_elim_col, AT_source.rowPtr, AT_source.colVal, AT_source.nzVal,
       plan.keep_row_mask, zero_tol, selected_count);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_doubleton_equations_batch_entry_counts");
   throw_if_cuda_error(cudaMemcpy(entry_prefix, entry_counts,
-                                 sizeof(std::int32_t) * static_cast<std::size_t>(selected_count),
+                                 sizeof(NnzOffset) * static_cast<std::size_t>(selected_count),
                                  cudaMemcpyDeviceToDevice),
                       "cudaMemcpy doubleton batch entry_prefix");
   inclusive_scan_i32(entry_prefix, selected_count, "cub inclusive scan doubleton batch entries");
-  std::int32_t total_entries = 0;
-  throw_if_cuda_error(cudaMemcpy(&total_entries, entry_prefix + selected_count - 1, sizeof(std::int32_t),
+  NnzOffset total_entries = 0;
+  throw_if_cuda_error(cudaMemcpy(&total_entries, entry_prefix + selected_count - 1, sizeof(NnzOffset),
                                  cudaMemcpyDeviceToHost),
                       "cudaMemcpy doubleton batch total_entries");
   if (total_entries <= 0) {
@@ -1266,8 +1388,8 @@ DeviceCsrMatrix build_doubleton_batch_new_A(const DeviceCsrMatrix& source,
     return out;
   }
 
-  // The prefix conversion writes the initial zero and the terminal offset.
-  throw_if_cuda_error(doubleton_cuda_malloc(&entry_starts, sizeof(std::int32_t) * (static_cast<std::size_t>(selected_count) + 1)),
+  // The prefix-to-row-pointer kernel also writes the terminal sentinel.
+  throw_if_cuda_error(doubleton_cuda_malloc(&entry_starts, sizeof(NnzOffset) * (static_cast<std::size_t>(selected_count) + 1)),
                       "cudaMalloc doubleton batch entry_starts");
   _kernel_row_ptr_from_prefix<<<blocks_selected, GPU_PRESOLVE_THREADS>>>(entry_starts, entry_prefix, selected_count);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_row_ptr_from_prefix batch entry starts");
@@ -1280,43 +1402,61 @@ DeviceCsrMatrix build_doubleton_batch_new_A(const DeviceCsrMatrix& source,
       candidate_keep_val, candidate_elim_val, plan.new_AU, AT_source.rowPtr, AT_source.colVal, AT_source.nzVal,
       plan.keep_row_mask, zero_tol, source.cols, selected_count);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_doubleton_equations_batch_build_delta");
-  // Use deterministic row-major ordering to preserve the floating-point
-  // merge order for duplicate (row, col) deltas.
+  // Keep the deterministic row-major ordering used by the paper path.  This
+  // preserves the floating-point merge order for duplicate (row, col) deltas.
   thrust::sort_by_key(doubleton_thrust_policy(),
                       thrust::device_pointer_cast(delta_keys),
                       thrust::device_pointer_cast(delta_keys + total_entries),
                       thrust::device_pointer_cast(delta_vals));
   throw_if_cuda_error(cudaGetLastError(), "thrust sort doubleton delta keys");
 
-  throw_if_cuda_error(doubleton_cuda_malloc(&delta_row_counts, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&delta_row_counts, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows)),
                       "cudaMalloc doubleton batch delta_row_counts");
-  throw_if_cuda_error(cudaMemset(delta_row_counts, 0, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows)),
+  throw_if_cuda_error(cudaMemset(delta_row_counts, 0, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows)),
                       "cudaMemset doubleton batch delta_row_counts");
   const int blocks_delta = (total_entries + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
   _kernel_delta_row_counts<<<blocks_delta, GPU_PRESOLVE_THREADS>>>(
       delta_row_counts, delta_keys, total_entries, source.cols);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_delta_row_counts");
   inclusive_scan_i32(delta_row_counts, source.rows, "cub inclusive scan doubleton delta rows");
-  throw_if_cuda_error(doubleton_cuda_malloc(&delta_row_ptr, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows + 1)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&delta_row_ptr, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows + 1)),
                       "cudaMalloc doubleton batch delta_row_ptr");
   _kernel_row_ptr_from_prefix<<<blocks_rows, GPU_PRESOLVE_THREADS>>>(delta_row_ptr, delta_row_counts, source.rows);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_row_ptr_from_prefix delta rows");
-  throw_if_cuda_error(doubleton_cuda_malloc(&row_counts_new, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&row_counts_new, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows)),
                       "cudaMalloc doubleton batch row_counts_new");
+  const int long_threshold = parallel_long_rows ? detail::DOUBLETON_LONG_ROW_THRESHOLD : 0;
+  const int long_capacity = parallel_long_rows ? static_cast<int>(std::min<std::int64_t>(
+      source.rows, (static_cast<std::int64_t>(source.nnz) + total_entries) / long_threshold)) : 0;
+  const int long_blocks = std::min(long_capacity, 256);
+  if (long_capacity > 0) {
+    throw_if_cuda_error(doubleton_cuda_malloc(&long_rows, sizeof(int) * long_capacity), "doubleton long rows");
+    throw_if_cuda_error(doubleton_cuda_malloc(&long_count, sizeof(int)), "doubleton long count");
+    throw_if_cuda_error(cudaMemsetAsync(long_count, 0, sizeof(int)), "doubleton reset long count");
+    throw_if_cuda_error(doubleton_cuda_malloc(&segment_counts,
+        sizeof(NnzOffset) * static_cast<std::size_t>(long_capacity) * detail::DOUBLETON_MERGE_THREADS),
+        "doubleton segment counts");
+  }
   _kernel_doubleton_equations_merged_row_counts<<<blocks_rows, GPU_PRESOLVE_THREADS>>>(
       row_counts_new, source.rowPtr, source.colVal, source.nzVal, delta_row_ptr, delta_keys, delta_vals,
-      zero_tol, source.rows, source.cols);
+      zero_tol, source.rows, source.cols, long_threshold, long_rows, long_count);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_doubleton_equations_merged_row_counts");
+  if (long_blocks > 0) {
+    detail::doubleton_merge_long_rows<false><<<long_blocks, detail::DOUBLETON_MERGE_THREADS>>>(
+        source.rowPtr, source.colVal, source.nzVal, delta_row_ptr, delta_keys, delta_vals,
+        long_rows, long_count, source.cols, zero_tol, row_counts_new, segment_counts);
+    throw_if_cuda_error(cudaGetLastError(), "doubleton count long rows");
+  }
   inclusive_scan_i32(row_counts_new, source.rows, "cub inclusive scan doubleton merged rows");
-  std::int32_t nnz_new = 0;
-  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts_new + source.rows - 1, sizeof(std::int32_t),
+  NnzOffset nnz_new = 0;
+  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts_new + source.rows - 1, sizeof(NnzOffset),
                                  cudaMemcpyDeviceToHost),
                       "cudaMemcpy doubleton batch nnz_new");
 
   out.rows = source.rows;
   out.cols = source.cols;
   out.nnz = nnz_new;
-  throw_if_cuda_error(doubleton_cuda_malloc(&out.rowPtr, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows + 1)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&out.rowPtr, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows + 1)),
                       "cudaMalloc doubleton batch rowPtr_new");
   _kernel_row_ptr_from_prefix<<<blocks_rows, GPU_PRESOLVE_THREADS>>>(out.rowPtr, row_counts_new, source.rows);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_row_ptr_from_prefix merged rows");
@@ -1327,10 +1467,18 @@ DeviceCsrMatrix build_doubleton_batch_new_A(const DeviceCsrMatrix& source,
                         "cudaMalloc doubleton batch nzVal_new");
     _kernel_doubleton_equations_copy_merged_rows<<<blocks_rows, GPU_PRESOLVE_THREADS>>>(
         out.colVal, out.nzVal, out.rowPtr, source.rowPtr, source.colVal, source.nzVal, delta_row_ptr,
-        delta_keys, delta_vals, zero_tol, source.rows, source.cols);
+        delta_keys, delta_vals, zero_tol, source.rows, source.cols, long_threshold);
     throw_if_cuda_error(cudaGetLastError(), "_kernel_doubleton_equations_copy_merged_rows");
+    if (long_blocks > 0) {
+      detail::doubleton_merge_long_rows<true><<<long_blocks, detail::DOUBLETON_MERGE_THREADS>>>(
+          source.rowPtr, source.colVal, source.nzVal, delta_row_ptr, delta_keys, delta_vals,
+          long_rows, long_count, source.cols, zero_tol, nullptr, segment_counts,
+          out.rowPtr, out.colVal, out.nzVal);
+      throw_if_cuda_error(cudaGetLastError(), "doubleton copy long rows");
+    }
   }
   *matrix_changed = true;
+  doubleton_cuda_free(long_rows); doubleton_cuda_free(long_count); doubleton_cuda_free(segment_counts);
 
   doubleton_cuda_free(entry_counts); doubleton_cuda_free(entry_prefix); doubleton_cuda_free(entry_starts); doubleton_cuda_free(delta_keys); doubleton_cuda_free(delta_vals);
   doubleton_cuda_free(delta_row_counts); doubleton_cuda_free(delta_row_ptr); doubleton_cuda_free(row_counts_new);
@@ -1358,77 +1506,6 @@ void count_mask_to_device(std::uint8_t* mask,
                       "cudaMemcpy mask count to batch summary");
 }
 
-DeviceCsrMatrix transpose_csr_local(const DeviceCsrMatrix& A) {
-  DeviceCsrMatrix AT;
-  AT.rows = A.cols;
-  AT.cols = A.rows;
-  AT.nnz = A.nnz;
-  cusparseHandle_t handle = nullptr;
-  void* buffer = nullptr;
-  try {
-    throw_if_cuda_error(
-        doubleton_cuda_malloc(&AT.rowPtr,
-                              sizeof(std::int32_t) * static_cast<std::size_t>(AT.rows + 1)),
-        "cudaMalloc doubleton transpose rowPtr");
-    if (A.nnz == 0) {
-      throw_if_cuda_error(
-          cudaMemset(AT.rowPtr, 0,
-                     sizeof(std::int32_t) * static_cast<std::size_t>(AT.rows + 1)),
-          "cudaMemset doubleton empty transpose rowPtr");
-      return AT;
-    }
-    throw_if_cuda_error(
-        doubleton_cuda_malloc(&AT.colVal,
-                              sizeof(std::int32_t) * static_cast<std::size_t>(A.nnz)),
-        "cudaMalloc doubleton transpose colVal");
-    throw_if_cuda_error(
-        doubleton_cuda_malloc(&AT.nzVal, sizeof(double) * static_cast<std::size_t>(A.nnz)),
-        "cudaMalloc doubleton transpose nzVal");
-    throw_if_cusparse_error(cusparseCreate(&handle),
-                            "cusparseCreate doubleton transpose");
-    std::size_t buffer_size = 0;
-    constexpr cusparseCsr2CscAlg_t alg = CUSPARSE_CSR2CSC_ALG1;
-    throw_if_cusparse_error(
-        cusparseCsr2cscEx2_bufferSize(
-            handle, A.rows, A.cols, A.nnz, A.nzVal, A.rowPtr, A.colVal,
-            AT.nzVal, AT.rowPtr, AT.colVal, CUDA_R_64F, CUSPARSE_ACTION_NUMERIC,
-            CUSPARSE_INDEX_BASE_ZERO, alg, &buffer_size),
-        "cusparseCsr2cscEx2_bufferSize doubleton transpose");
-    if (buffer_size > 0) {
-      throw_if_cuda_error(doubleton_cuda_malloc(&buffer, buffer_size),
-                          "cudaMalloc doubleton transpose buffer");
-    }
-    throw_if_cusparse_error(
-        cusparseCsr2cscEx2(
-            handle, A.rows, A.cols, A.nnz, A.nzVal, A.rowPtr, A.colVal,
-            AT.nzVal, AT.rowPtr, AT.colVal, CUDA_R_64F, CUSPARSE_ACTION_NUMERIC,
-            CUSPARSE_INDEX_BASE_ZERO, alg, buffer),
-        "cusparseCsr2cscEx2 doubleton transpose");
-    doubleton_cuda_free(buffer);
-    buffer = nullptr;
-    throw_if_cusparse_error(cusparseDestroy(handle),
-                            "cusparseDestroy doubleton transpose");
-    handle = nullptr;
-  } catch (...) {
-    doubleton_cuda_free(buffer);
-    if (handle != nullptr) {
-      cusparseDestroy(handle);
-    }
-    doubleton_cuda_free(AT.rowPtr);
-    doubleton_cuda_free(AT.colVal);
-    doubleton_cuda_free(AT.nzVal);
-    throw;
-  }
-  return AT;
-}
-
-void free_local_csr(DeviceCsrMatrix& A) {
-  doubleton_cuda_free(A.rowPtr);
-  doubleton_cuda_free(A.colVal);
-  doubleton_cuda_free(A.nzVal);
-  A = DeviceCsrMatrix{};
-}
-
 bool apply_rule_doubleton_equations_batch_once(PresolvePlanGpu& plan,
                                         const LPInfoGpu& lp,
                                         const DeviceCsrMatrix& AT_source,
@@ -1445,7 +1522,7 @@ bool apply_rule_doubleton_equations_batch_once(PresolvePlanGpu& plan,
   const int blocks_rows = (m + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
   const int blocks_cols = (n + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
   const double ratio_tol = fmax(1.0e-9, pparams.bound_tol);
-  const bool profile_batch = env_enabled("GPUPRESOLVER_DOUBLETON_BATCH_PROFILE");
+  const bool profile_batch = runtime::options().profile_doubleton;
 
   std::int32_t* live_col_nnz = nullptr;
   std::uint8_t* candidate_mask = nullptr;
@@ -1688,105 +1765,60 @@ bool apply_rule_doubleton_equations_batch_once(PresolvePlanGpu& plan,
 bool apply_rule_doubleton_equations_batch(PresolvePlanGpu& plan,
                                    const LPInfoGpu& lp,
                                    const PresolveParams& pparams) {
-  bool changed_any = false;
   DeviceCsrMatrix AT_source = lp.AT;
   sort_csr_rows_by_col_thrust(AT_source, "doubleton sort input AT rows");
-  bool owns_at_source = false;
-  const bool scan_enabled = pparams.doubleton_equations_scan;
-  const int batch_round_limit =
-      scan_enabled && pparams.doubleton_equations_max_batch_rounds > 0 &&
-              pparams.doubleton_equations_max_batch_rounds < DOUBLETON_EQUATION_BATCH_INNER_ROUNDS
-          ? pparams.doubleton_equations_max_batch_rounds
-          : DOUBLETON_EQUATION_BATCH_INNER_ROUNDS;
-  const bool has_batch_time_limit =
-      scan_enabled && pparams.doubleton_equations_max_time > 0.0 && std::isfinite(pparams.doubleton_equations_max_time);
-  const auto scan_start = std::chrono::steady_clock::now();
-  const bool profile_batch = env_enabled("GPUPRESOLVER_DOUBLETON_BATCH_PROFILE");
   DoubletonBatchTapeBuffer tape_buffer;
   double* batch_obj_deltas_device = nullptr;
   throw_if_cuda_error(
-      doubleton_cuda_malloc(
-          &batch_obj_deltas_device,
-          sizeof(double) * 2 * static_cast<std::size_t>(batch_round_limit)),
-      "cudaMalloc accumulated doubleton batch objective deltas");
+      doubleton_cuda_malloc(&batch_obj_deltas_device, sizeof(double) * 2),
+      "cudaMalloc doubleton batch objective deltas");
   throw_if_cuda_error(
-      cudaMemsetAsync(batch_obj_deltas_device,
-                      0,
-                      sizeof(double) * 2 * static_cast<std::size_t>(batch_round_limit),
-                      nullptr),
-      "cudaMemset accumulated doubleton batch objective deltas");
-  std::int32_t changed_batch_count = 0;
+      cudaMemsetAsync(batch_obj_deltas_device, 0, sizeof(double) * 2, nullptr),
+      "cudaMemset doubleton batch objective deltas");
 
-  for (int round = 0; round < batch_round_limit; ++round) {
-    if (has_batch_time_limit) {
-      const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - scan_start;
-      if (elapsed.count() >= pparams.doubleton_equations_max_time) {
-        if (profile_batch) {
-          std::cout << ">>> [doubleton_equations batch C++] scan stop: max_time\n";
-        }
-        break;
-      }
-    }
-    const bool changed = apply_rule_doubleton_equations_batch_once(
-        plan,
-        lp,
-        AT_source,
-        pparams,
-        pparams.record_postsolve_tape ? &tape_buffer : nullptr,
-        batch_obj_deltas_device + 2 * changed_batch_count,
-        batch_obj_deltas_device + 2 * changed_batch_count + 1);
-    if (plan.has_infeasible || plan.has_unbounded) {
-      changed_any = changed_any || changed;
-      break;
-    }
-    if (!changed) {
-      break;
-    }
-    changed_any = true;
-    ++changed_batch_count;
-    if (plan.has_new_A) {
-      if (owns_at_source) {
-        free_local_csr(AT_source);
-      }
-      AT_source = transpose_csr_local(plan.new_A);
-      owns_at_source = true;
-    }
-  }
-  if (owns_at_source) {
-    free_local_csr(AT_source);
-  }
+  // Process one independent batch. Later batches belong to later scheduler
+  // executions; do not transpose the rewritten matrix for an unused next batch.
+  const bool changed = apply_rule_doubleton_equations_batch_once(
+      plan,
+      lp,
+      AT_source,
+      pparams,
+      pparams.record_postsolve_tape ? &tape_buffer : nullptr,
+      batch_obj_deltas_device,
+      batch_obj_deltas_device + 1);
+
   if (pparams.record_postsolve_tape && tape_buffer.count > 0) {
-    const std::vector<DoubletonBatchTapeRecord> tape_records =
-        copy_device_vector(tape_buffer.records,
-                           tape_buffer.count,
-                           "cudaMemcpy accumulated doubleton batch tape");
-    append_doubleton_batch_tape_records(plan.tape, tape_records);
-  }
-  if (changed_batch_count > 0) {
-    const std::vector<double> batch_obj_deltas =
-        copy_device_vector(batch_obj_deltas_device,
-                           2 * changed_batch_count,
-                           "cudaMemcpy accumulated doubleton batch objective deltas");
-    for (std::int32_t batch = 0; batch < changed_batch_count; ++batch) {
-      plan.obj_constant_delta += batch_obj_deltas[2 * batch];
-      plan.obj_constant_delta += batch_obj_deltas[2 * batch + 1];
+    if (plan.tape.resident) {
+      PostsolveTapeGpu segment;
+      build_doubleton_postsolve_tape_gpu(segment, tape_buffer.records, tape_buffer.count);
+      append_device_recovery_segment(plan.tape, std::move(segment));
+    } else {
+      const std::vector<DoubletonBatchTapeRecord> tape_records = copy_device_vector(
+          tape_buffer.records, tape_buffer.count, "cudaMemcpy doubleton batch tape");
+      append_doubleton_batch_tape_records(plan.tape, tape_records);
     }
+  }
+  if (changed && !plan.has_infeasible && !plan.has_unbounded) {
+    const std::vector<double> batch_obj_deltas =
+        copy_device_vector(batch_obj_deltas_device, 2, "cudaMemcpy doubleton batch objective deltas");
+    plan.obj_constant_delta += batch_obj_deltas[0];
+    plan.obj_constant_delta += batch_obj_deltas[1];
   }
   doubleton_cuda_free(batch_obj_deltas_device);
-  return changed_any;
+  return changed;
 }
 
 __global__ void _kernel_copy_doubleton_equations_rows(std::int32_t* col_val_new,
                                                double* nz_val_new,
-                                               const std::int32_t* row_ptr_new,
-                                               const std::int32_t* row_ptr,
+                                               const NnzOffset* row_ptr_new,
+                                               const NnzOffset* row_ptr,
                                                const std::int32_t* col_val,
                                                const double* nz_val,
                                                const std::int32_t* meta_i32,
                                                const double* meta_f64,
                                                double zero_tol,
                                                std::int32_t m) {
-  const std::int32_t r = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const std::int32_t r = static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (r >= m) {
     return;
   }
@@ -1795,14 +1827,14 @@ __global__ void _kernel_copy_doubleton_equations_rows(std::int32_t* col_val_new,
   const std::int32_t keep_col = meta_i32[2];
   const double alpha = -meta_f64[1] / meta_f64[0];
 
-  const std::int32_t first = row_ptr[r];
-  const std::int32_t last = row_ptr[r + 1];
-  std::int32_t write = row_ptr_new[r];
+  const NnzOffset first = row_ptr[r];
+  const NnzOffset last = row_ptr[r + 1];
+  NnzOffset write = row_ptr_new[r];
   if (first >= last) {
     return;
   }
   if (r == target_row) {
-    for (std::int32_t p = first; p < last; ++p) {
+    for (NnzOffset p = first; p < last; ++p) {
       col_val_new[write] = col_val[p];
       nz_val_new[write] = nz_val[p];
       ++write;
@@ -1814,7 +1846,7 @@ __global__ void _kernel_copy_doubleton_equations_rows(std::int32_t* col_val_new,
   bool keep_present = false;
   double are = 0.0;
   double old_keep = 0.0;
-  for (std::int32_t p = first; p < last; ++p) {
+  for (NnzOffset p = first; p < last; ++p) {
     const std::int32_t col = col_val[p];
     const double val = nz_val[p];
     if (col == elim_col) {
@@ -1829,7 +1861,7 @@ __global__ void _kernel_copy_doubleton_equations_rows(std::int32_t* col_val_new,
   const double new_keep = old_keep + alpha * are;
   const bool insert_keep = elim_present && !keep_present && fabs(new_keep) > zero_tol;
   bool inserted = !insert_keep;
-  for (std::int32_t p = first; p < last; ++p) {
+  for (NnzOffset p = first; p < last; ++p) {
     const std::int32_t col = col_val[p];
     const double val = nz_val[p];
     if (insert_keep && !inserted && col > keep_col) {
@@ -1867,8 +1899,8 @@ DeviceCsrMatrix build_doubleton_scalar_new_A(const DeviceCsrMatrix& source,
     return out;
   }
 
-  std::int32_t* row_counts = nullptr;
-  throw_if_cuda_error(doubleton_cuda_malloc(&row_counts, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows)),
+  NnzOffset* row_counts = nullptr;
+  throw_if_cuda_error(doubleton_cuda_malloc(&row_counts, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows)),
                       "cudaMalloc doubleton row_counts");
   const int blocks = (source.rows + GPU_PRESOLVE_THREADS - 1) / GPU_PRESOLVE_THREADS;
   _kernel_doubleton_equations_row_counts<<<blocks, GPU_PRESOLVE_THREADS>>>(
@@ -1877,12 +1909,12 @@ DeviceCsrMatrix build_doubleton_scalar_new_A(const DeviceCsrMatrix& source,
 
   inclusive_scan_i32(row_counts, source.rows, "cub inclusive scan doubleton scalar rows");
 
-  std::int32_t nnz_new = 0;
-  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts + source.rows - 1, sizeof(std::int32_t),
+  NnzOffset nnz_new = 0;
+  throw_if_cuda_error(cudaMemcpy(&nnz_new, row_counts + source.rows - 1, sizeof(NnzOffset),
                                  cudaMemcpyDeviceToHost),
                       "cudaMemcpy doubleton nnz_new");
   out.nnz = nnz_new;
-  throw_if_cuda_error(doubleton_cuda_malloc(&out.rowPtr, sizeof(std::int32_t) * static_cast<std::size_t>(source.rows + 1)),
+  throw_if_cuda_error(doubleton_cuda_malloc(&out.rowPtr, sizeof(NnzOffset) * static_cast<std::size_t>(source.rows + 1)),
                       "cudaMalloc doubleton rowPtr_new");
   _kernel_row_ptr_from_prefix<<<blocks, GPU_PRESOLVE_THREADS>>>(out.rowPtr, row_counts, source.rows);
   throw_if_cuda_error(cudaGetLastError(), "_kernel_row_ptr_from_prefix doubleton");
@@ -1914,7 +1946,6 @@ void apply_rule_doubleton_equations(PresolvePlanGpu& plan,
                              const LPInfoGpu& lp,
                              const PresolveStatsGpu& stats,
                              const PresolveParams& pparams) {
-  (void)stats;
   if (plan.has_infeasible || plan.has_unbounded) {
     return;
   }
@@ -2025,45 +2056,55 @@ void apply_rule_doubleton_equations(PresolvePlanGpu& plan,
     plan.has_infeasible = true;
   } else if (status_host[1] != 0) {
     if (pparams.record_postsolve_tape) {
-      std::int32_t meta_i32_host[3] = {0, 0, 0};
-      double meta_f64_host[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-      throw_if_cuda_error(cudaMemcpy(meta_i32_host, meta_i32, sizeof(meta_i32_host), cudaMemcpyDeviceToHost),
-                          "cudaMemcpy doubleton meta_i32 for tape");
-      throw_if_cuda_error(cudaMemcpy(meta_f64_host, meta_f64, sizeof(meta_f64_host), cudaMemcpyDeviceToHost),
-                          "cudaMemcpy doubleton meta_f64 for tape");
-      const std::int32_t elim_col = meta_i32_host[1];
-      const std::int32_t keep_col = meta_i32_host[2];
-      double new_keep_l = 0.0;
-      double new_keep_u = 0.0;
-      throw_if_cuda_error(cudaMemcpy(&new_keep_l, plan.new_l + keep_col, sizeof(double), cudaMemcpyDeviceToHost),
-                          "cudaMemcpy doubleton new keep l for tape");
-      throw_if_cuda_error(cudaMemcpy(&new_keep_u, plan.new_u + keep_col, sizeof(double), cudaMemcpyDeviceToHost),
-                          "cudaMemcpy doubleton new keep u for tape");
-      append_postsolve_record(
-          plan.tape,
-          PostsolveReductionType::DoubletonEquation,
-          std::vector<std::int32_t>{elim_col, keep_col, meta_i32_host[0], 0},
-          std::vector<double>{meta_f64_host[0],
-                              meta_f64_host[1],
-                              meta_f64_host[2],
-                              meta_f64_host[3],
-                              meta_f64_host[4],
-                              meta_f64_host[6],
-                              meta_f64_host[7],
-                              new_keep_l,
-                              new_keep_u,
-                              meta_f64_host[5],
-                              0.0,
-                              0.0},
-          PostsolveDualMode::Minimal);
+      if (plan.tape.resident) {
+        DoubletonBatchTapeRecord *one = nullptr;
+        throw_if_cuda_error(doubleton_cuda_malloc(&one, sizeof(DoubletonBatchTapeRecord)),
+                            "allocate scalar recovery");
+        capture_scalar_recovery<<<1, 1>>>(one, meta_i32, meta_f64, plan.new_l, plan.new_u);
+        throw_if_cuda_error(cudaGetLastError(), "capture scalar recovery");
+        PostsolveTapeGpu segment;
+        build_doubleton_postsolve_tape_gpu(segment, one, 1);
+        append_device_recovery_segment(plan.tape, std::move(segment));
+        doubleton_cuda_free(one);
+      } else {
+
+        std::int32_t meta_i32_host[3] = {0, 0, 0};
+        double meta_f64_host[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        throw_if_cuda_error(
+            cudaMemcpy(meta_i32_host, meta_i32, sizeof(meta_i32_host), cudaMemcpyDeviceToHost),
+            "cudaMemcpy doubleton meta_i32 for tape");
+        throw_if_cuda_error(
+            cudaMemcpy(meta_f64_host, meta_f64, sizeof(meta_f64_host), cudaMemcpyDeviceToHost),
+            "cudaMemcpy doubleton meta_f64 for tape");
+        const std::int32_t elim_col = meta_i32_host[1];
+        const std::int32_t keep_col = meta_i32_host[2];
+        double new_keep_l = 0.0;
+        double new_keep_u = 0.0;
+        throw_if_cuda_error(
+            cudaMemcpy(&new_keep_l, plan.new_l + keep_col, sizeof(double), cudaMemcpyDeviceToHost),
+            "cudaMemcpy doubleton new keep l for tape");
+        throw_if_cuda_error(
+            cudaMemcpy(&new_keep_u, plan.new_u + keep_col, sizeof(double), cudaMemcpyDeviceToHost),
+            "cudaMemcpy doubleton new keep u for tape");
+        append_postsolve_record(plan.tape, PostsolveReductionType::DoubletonEquation,
+                                std::vector<std::int32_t>{elim_col, keep_col, meta_i32_host[0], 0},
+                                std::vector<double>{meta_f64_host[0], meta_f64_host[1],
+                                                    meta_f64_host[2], meta_f64_host[3],
+                                                    meta_f64_host[4], meta_f64_host[6],
+                                                    meta_f64_host[7], new_keep_l, new_keep_u,
+                                                    meta_f64_host[5], 0.0, 0.0},
+                                PostsolveDualMode::Minimal);
+      }
     }
     const DeviceCsrMatrix source_A = plan.has_new_A ? plan.new_A : lp.A;
+    const bool free_old_new_A = plan.has_new_A;
     DeviceCsrMatrix rewritten_A = build_doubleton_scalar_new_A(source_A, meta_i32, meta_f64, pparams.zero_tol);
     if (plan.has_new_A) {
       doubleton_cuda_free(plan.new_A.rowPtr);
       doubleton_cuda_free(plan.new_A.colVal);
       doubleton_cuda_free(plan.new_A.nzVal);
     }
+    (void)free_old_new_A;
     plan.new_A = rewritten_A;
     plan.has_new_A = true;
     double obj_delta = 0.0;

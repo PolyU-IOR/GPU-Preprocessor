@@ -2,9 +2,27 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
 #include <utility>
 
 namespace gpu_presolver::presolve {
+
+PostsolveTape::PostsolveTape(const PostsolveTape &other) { *this = other; }
+PostsolveTape &PostsolveTape::operator=(const PostsolveTape &other) {
+  if (this == &other)
+    return *this;
+  if (!other.segments.empty())
+    throw std::logic_error("export local device tape before host copy");
+  segments.clear();
+  resident = other.resident;
+  types = other.types;
+  index_starts = other.index_starts;
+  value_starts = other.value_starts;
+  dual_modes = other.dual_modes;
+  indices = other.indices;
+  vals = other.vals;
+  return *this;
+}
 
 PostsolveTapeGpu::~PostsolveTapeGpu() {
   reset();
