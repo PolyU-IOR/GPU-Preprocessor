@@ -190,3 +190,21 @@ compared with 147.227 seconds using PSLP and 973.876 seconds using Gurobi Presol
 ## License
 
 [MIT](LICENSE).
+
+## Citation
+
+If you use GPU-Preprocessor in your research, please cite our
+[paper](https://arxiv.org/html/2610.19840):
+
+```bibtex
+@misc{chen2026gpuacceleratedpreprocessinglargescalelinear,
+  title = {{GPU}-Accelerated Preprocessing for Large-Scale Linear Programming},
+  author = {Kaihuang Chen and Jiawei Lu and Defeng Sun and Yancheng Yuan
+            and Guojun Zhang and Xiangyu Zhang and Xinyuan Zhao},
+  year = {2026},
+  eprint = {2610.19840},
+  archivePrefix = {arXiv},
+  primaryClass = {math.OC},
+  url = {https://arxiv.org/abs/2610.19840}
+}
+```
