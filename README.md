@@ -1,15 +1,20 @@
 # GPU-Preprocessor
 
-GPU-Preprocessor is a C++/CUDA package for GPU-based LP folding, presolve,
-and solution recovery. It reduces a linear program before an external solver
-solves it, then recovers a solution in the original model space.
+GPU-Preprocessor is a C++/CUDA package for GPU-based folding, presolve, and
+solution recovery. It preprocesses optimization problems before they are passed
+to an external solver, then recovers solutions in the original model space.
 
-The preprocessor first applies **folding**, then **presolve**. Both stages are
-enabled by default. Folding groups rows and variables with matching structure
-to form a smaller LP for presolve. After solving, postsolve and unfolding
-recover the solution in the original model space.
+The default pipeline runs **Startup presolve**, **folding**, then **Main
+presolve**. Startup applies structural reductions once; Main schedules ordinary
+cleanup, propagation and aggregation. Folding groups rows and variables with
+matching structure between those stages. After solving, recovery reverses Main,
+folding and Startup to restore the original model coordinates.
 
-The package supports continuous linear programs of the form:
+See the [postsolve implementation guide](lp/src/presolve/postsolve/README.md)
+for recovery order, source ownership and diagnostic controls.
+
+The current implementation supports continuous linear programming (LP) problems
+of the form:
 
 ```text
 minimize    cᵀx + c0
@@ -20,7 +25,8 @@ subject to  AL ≤ Ax ≤ AU
 ## Installation
 
 Requires Linux, Make, CMake 3.24+, a C++17 compiler, CUDA Toolkit 12+ (nvcc and
-cuSPARSE), and an NVIDIA GPU. Run from the project root:
+cuSPARSE and cuBLAS), and an NVIDIA GPU. The paper experiments used CUDA Toolkit 13.3.33.
+Run from the project root:
 
 ```sh
 make
@@ -28,6 +34,10 @@ make
 
 This builds the library, command-line tools, and example, automatically selecting
 the local GPU architecture.
+
+Include `gpu_preprocessor/lp.hpp` and use the `gpu_preprocessor::lp` namespace.
+CMake options, compile definitions and diagnostic environment variables use
+`GPUPREPROCESSOR_*`.
 
 ## Usage
 
@@ -38,25 +48,27 @@ with an uncompressed MPS file for a continuous minimization LP. Integer-marked
 inputs are treated as LP relaxations.
 
 ```sh
-# Run folding followed by presolve and print status, dimensions, and timing
+# Run Startup, folding and Main; print status, dimensions and timing
 ./build/bin/gpu_preprocessor_mps model.mps
 
 # Run presolve only
 ./build/bin/gpu_preprocessor_mps model.mps --folding false
 
-# Run folding followed by presolve and export the reduced LP
+# Export the reduced LP after Startup, folding and Main
 ./build/bin/gpu_preprocessor_export_reduced model.mps reduced/
 ```
 
 The exporter writes `meta.txt` and binary LP data to `reduced/` for an external
-solver. Use `--help` to list options.
+solver. The metadata format is `gpu_preprocessor_reduced_lp_v1` with 32-bit
+sparse offsets, or `gpu_preprocessor_reduced_lp_v2` with 64-bit offsets.
+Use `--help` to list options.
 
 **C++:** pass a GPU-resident `DeviceLp` to `preprocess`, solve the reduced LP,
 then call `postprocess` to recover the original solution:
 
 ```cpp
-#include "gpu_preprocessor/gpu_preprocessor.hpp"
-namespace gpp = gpu_preprocessor;
+#include "gpu_preprocessor/lp.hpp"
+namespace gpp = gpu_preprocessor::lp;
 
 auto s = gpp::preprocess(lp);
 if (!s.presolve.has_infeasible && !s.presolve.has_unbounded) {
@@ -67,46 +79,75 @@ gpp::free_summary(s);
 ```
 
 `solution.x`, `solution.y`, and `solution.z` are host vectors. See the
-[API header](cpp/include/gpu_preprocessor/gpu_preprocessor.hpp) for input and
+[API header](lp/include/gpu_preprocessor/lp.hpp) for input and
 ownership requirements. Folding and dual recovery have known numerical
 limitations; validate the recovered solution against the original LP.
+Keep the original LP and summary alive until recovery finishes. Input arrays
+are borrowed; do not copy owning summaries. `postprocess_device` returns owning
+GPU vectors that the caller releases with `cudaFree`. Both recovery entry points
+default `primal_tolerance` to zero, disabling primal polish. A positive value
+permits guarded variable-pair correction.
 
 To link from a C++17/CUDA project:
 
 ```cmake
 add_subdirectory(path/to/GPU-Preprocessor gpu-preprocessor-build EXCLUDE_FROM_ALL)
-target_link_libraries(YOUR_TARGET PRIVATE GPUPreprocessor::core)
+target_link_libraries(YOUR_TARGET PRIVATE GPUPreprocessor::lp)
 ```
 
-**Example:** [presolve_example.cpp](examples/presolve_example.cpp) demonstrates
+For an installed package, use `find_package(GPUPreprocessor CONFIG REQUIRED COMPONENTS lp)`
+and link the same `GPUPreprocessor::lp` target.
+
+**Example:** [presolve_example.cpp](lp/examples/presolve_example.cpp) demonstrates
 preprocessing and recovery on a built-in toy LP. It is built with the main project:
 
 ```sh
 ./build/bin/gpu_preprocessor_example
 ```
 
-For the MPS tools, [model.mps](examples/model.mps) provides a small input LP.
+For the MPS tools, [model.mps](lp/examples/model.mps) provides a small input LP.
 
 ## Parameters
 
-Set these fields in `gpu_preprocessor::Parameters` when calling the C++ API:
+Set these fields in `gpu_preprocessor::lp::Parameters` when calling the C++ API:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `enable_folding` | `true` | Enable folding before presolve |
-| `enable_presolve` | `true` | Enable GPU presolve |
+| `enable_folding` | `true` | Enable folding between Startup and Main |
+| `enable_presolve` | `true` | Enable Startup and Main presolve |
 | `max_iters` | `512` | Presolve scheduler iteration budget |
 | `max_time` | `∞` | Soft presolve time limit in seconds, checked between phases |
-| `enable_structure_specific_rules` | `true` | Enable the five structure-specific reduction families |
+| `enable_startup` | `true` | Enable the Startup presolve stage before folding and Main |
 
 Set `enable_folding = false` to run presolve only, or `enable_presolve = false`
 to run folding only.
-Further tuning fields: [PresolveParams](cpp/include/gpu_presolver/presolve/presolve_structs.hpp).
+Set `enable_startup = false` to skip Startup while retaining folding and Main.
+Startup and Main share the presolve iteration/time budget. Without folding,
+they use one recovery record. Rebuild the library and callers together when
+updating.
+Further tuning fields: [PresolveParams](lp/include/gpu_preprocessor/lp/presolve/presolve_structs.hpp).
 For a command-line override:
 
 ```sh
 ./build/bin/gpu_preprocessor_mps model.mps --max-iters 20
 ```
+
+`preprocessing_seconds` measures the complete call on an uploaded LP. CLI
+`changed` includes folding and presolve, including changes that preserve model
+dimensions. `fixed_columns` is reported as `unavailable` because Main's count
+does not cover the complete pipeline.
+
+## Tests
+
+```sh
+make BUILD_DIR=build-check-32 CMAKE_ARGS='-DGPUPREPROCESSOR_BUILD_TESTS=ON'
+ctest --test-dir build-check-32 --output-on-failure --no-tests=error
+make BUILD_DIR=build-check-64 CMAKE_ARGS='-DGPUPREPROCESSOR_BUILD_TESTS=ON -DGPUPREPROCESSOR_USE_INT64_NNZ=ON'
+ctest --test-dir build-check-64 --output-on-failure --no-tests=error
+```
+
+Select an available GPU with `CUDA_VISIBLE_DEVICES`. Use separate build
+directories for sparse-offset widths and CUDA toolkits.
 
 ## Performance
 
@@ -130,7 +171,7 @@ arithmetic means. Lower is better for both metrics.
 |  | PSLP | 11.885 | 40.5 |
 |  | GPU-Preprocessor | **0.271** | **30.1** |
 
-> **Setup:** GPU-Preprocessor and HPR-LP use one NVIDIA H100 PCIe 80 GB GPU per
+> **Setup:** GPU-Preprocessor 0.1.1 and HPR-LP use one NVIDIA H100 PCIe 80 GB GPU per
 > run. PSLP 0.0.11 (full configuration) and Gurobi 12.0.2 (automatic presolve)
 > run on the same server's two Intel Xeon Gold 6548Y+ CPUs.
 > GPU-Preprocessor's preprocessing time includes folding and presolve.
@@ -178,7 +219,7 @@ QAP dimensions from 20 to 100. The largest has **1,980,200 rows, 49,015,000
 columns, and 198,020,000 nonzeros**. The figure compares preprocessing times
 on a logarithmic scale.
 
-![Preprocessing time versus QAP dimension for GPU-Preprocessor, PSLP, and Gurobi Presolve.](assets/qap_wil100_preprocessing_time.png)
+![Preprocessing time versus QAP dimension for GPU-Preprocessor, PSLP, and Gurobi Presolve.](lp/assets/qap_wil100_preprocessing_time.png)
 
 GPU-Preprocessor takes **less than 0.4 seconds** at all five tested sizes.
 PSLP is faster at dimension 20; GPU-Preprocessor is faster than both baselines

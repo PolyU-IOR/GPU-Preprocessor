@@ -5,8 +5,8 @@
 /.sync-tools export-ignore
 /build* export-ignore
 /cmake-build* export-ignore
-/cpp/build* export-ignore
-/cpp/cmake-build* export-ignore
+/lp/build* export-ignore
+/lp/cmake-build* export-ignore
 /reports export-ignore
 /results export-ignore
 /artifacts export-ignore
