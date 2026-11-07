@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Kaihuang Chen, Jiawei Lu, Defeng Sun, Yancheng Yuan, Guojun Zhang, Xiangyu Zhang, Xinyuan Zhao
 // SPDX-License-Identifier: MIT
 
-#include "../src/presolve/rules/parallel_signature_common.cuh"
+#include "../src/presolve/parallel_signature_common.cuh"
 
 #include <cassert>
 #include <iostream>

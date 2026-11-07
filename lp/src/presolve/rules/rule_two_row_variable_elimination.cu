@@ -5,7 +5,7 @@
 #include "gpu_preprocessor/lp/presolve/device_recovery.hpp"
 #include "gpu_preprocessor/lp/presolve/rules/rule_two_row_variable_elimination.hpp"
 
-#include "projection_support.cuh"
+#include "../projection_support.cuh"
 
 #include <cuda_runtime.h>
 

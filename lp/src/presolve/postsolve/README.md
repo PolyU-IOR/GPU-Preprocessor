@@ -52,7 +52,7 @@ fragments are included by `../gpu_postsolve.cu`, never compiled separately.
 
 Startup recovery first invokes the retained Poisson inverse, then applies the
 row-sparsification adjoint `y = S^T y'`. The built-in implementation in
-[`../poisson/`](../poisson/README.md) is enabled by default. It reconstructs
+[`../rules/rule_poisson.cu`](../rules/rule_poisson.cu) is enabled by default. It reconstructs
 temperatures and row duals through cuFFT, scatters source values and reduced
 costs, and computes fixed-variable duals from the original transpose. Recovery
 allocation failures propagate without returning a partially restored point.

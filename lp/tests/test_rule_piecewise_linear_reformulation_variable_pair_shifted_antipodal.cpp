@@ -7,7 +7,7 @@
 #include "gpu_preprocessor/lp/presolve/device_recovery.hpp"
 #include "gpu_preprocessor/lp/presolve/gpu_postsolve.hpp"
 #include "gpu_preprocessor/lp/presolve/gpu_presolve.hpp"
-#include "../src/presolve/rules/piecewise_linear_reformulation_variable_pair/shifted_antipodal.hpp"
+#include "../src/presolve/rules/piecewise_linear/shifted_antipodal.hpp"
 
 #include <cuda_runtime.h>
 

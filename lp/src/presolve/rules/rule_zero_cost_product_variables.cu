@@ -5,7 +5,7 @@
 #include "gpu_preprocessor/lp/presolve/device_recovery.hpp"
 #include "gpu_preprocessor/lp/presolve/rules/rule_zero_cost_product_variables.hpp"
 
-#include "projection_support.cuh"
+#include "../projection_support.cuh"
 
 #include <cuda_runtime.h>
 

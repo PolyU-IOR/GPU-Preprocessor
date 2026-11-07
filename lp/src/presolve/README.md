@@ -1,9 +1,41 @@
-# Certified Poisson Startup reduction
+# Presolve implementation
 
-`poisson.cu` owns certification orchestration, FFT plans, the response LP and
-its inverse. `kernels.cu` owns the complete device certificate, observation and
-source maps, Green-response evaluation, odd-extension solves and dual recovery.
-`kernels.cuh` is internal; public headers expose no cuFFT types.
+`gpu_presolve.cu` owns scheduling, including the epigraph-first variable-pair
+dispatch. Public rule declarations remain under `include/gpu_preprocessor/lp/presolve/rules/`.
+
+Each ordinary or Startup strategy has one implementation file in `rules/`.
+Rule-specific kernels and helpers live in that file. Empty rows and empty
+columns have separate entries. Piecewise-linear types share one directory:
+
+```text
+rules/
+  rule_poisson.cu
+  rule_empty_rows.cu
+  rule_empty_columns.cu
+  rule_doubleton_equations.cu
+  rule_parallel_rows.cu
+  rule_parallel_columns.cu
+  rule_*.cu
+  piecewise_linear/
+    absolute_value.cu
+    epigraph.cu
+    epigraph.hpp
+    shifted_antipodal.cu
+    shifted_antipodal.hpp
+```
+
+The piecewise-linear headers declare analysis state shared with dispatch and
+tests; each type's implementation stays in its corresponding `.cu` file.
+`parallel_signature_common.cuh` and `projection_support.cuh` in this directory
+are shared support for multiple strategies. Other model, plan and recovery
+support stays here too. See [postsolve](postsolve/README.md) for inverse replay.
+
+## Certified Poisson Startup reduction
+
+[`rules/rule_poisson.cu`](rules/rule_poisson.cu) owns the complete certificate,
+device kernels, observation/source maps, FFT plans, response LP and original-space
+inverse. These implementation details are private to its translation unit;
+public headers expose no cuFFT types.
 
 The accepted layout is a cubic interior grid with zero Dirichlet boundary and
 one source column per interior node. Every row must contain exactly the seven

@@ -7,8 +7,7 @@ add_library(gpu_preprocessor_lp STATIC
   src/folding/folding_map.cu
   src/folding/folding_reduce.cu
   src/folding/folding_refinement.cu
-  src/presolve/poisson/poisson.cu
-  src/presolve/poisson/kernels.cu
+  src/presolve/rules/rule_poisson.cu
   src/presolve/transpose64.cu
   src/presolve/device_recovery.cu
   src/presolve/identity_plan.cu
@@ -22,17 +21,16 @@ add_library(gpu_preprocessor_lp STATIC
   src/presolve/rules/rule_row_sparsification.cu
   src/presolve/gpu_presolve_kernels.cu
   src/presolve/presolve_structs.cu
-  src/presolve/rules/piecewise_linear_reformulation_variable_pair/shifted_antipodal.cu
+  src/presolve/rules/piecewise_linear/shifted_antipodal.cu
   src/presolve/rules/rule_two_row_variable_elimination.cu
   src/presolve/rules/rule_column_domination.cu
   src/presolve/rules/rule_infeasible_and_fixed_variables.cu
   src/presolve/rules/rule_infeasible_and_redundant_rows.cu
   src/presolve/rules/rule_doubleton_equations.cu
   src/presolve/rules/rule_dual_fix.cu
-  src/presolve/rules/empty_rows_and_columns/columns.cu
-  src/presolve/rules/empty_rows_and_columns/rows.cu
-  src/presolve/rules/rule_piecewise_linear_reformulation_variable_pair.cu
-  src/presolve/rules/piecewise_linear_reformulation_variable_pair/epigraph.cu
+  src/presolve/rules/rule_empty_columns.cu
+  src/presolve/rules/rule_empty_rows.cu
+  src/presolve/rules/piecewise_linear/epigraph.cu
   src/presolve/rules/rule_parallel_columns.cu
   src/presolve/rules/rule_parallel_rows.cu
   src/presolve/rules/rule_zero_cost_product_variables.cu
@@ -40,7 +38,7 @@ add_library(gpu_preprocessor_lp STATIC
   src/presolve/rules/rule_redundant_variable_bounds.cu
   src/presolve/rules/rule_singleton_columns.cu
   src/presolve/rules/rule_singleton_rows.cu
-  src/presolve/rules/rule_piecewise_linear_reformulation_absolute_value.cu
+  src/presolve/rules/piecewise_linear/absolute_value.cu
 )
 add_library(GPUPreprocessor::lp ALIAS gpu_preprocessor_lp)
 target_include_directories(gpu_preprocessor_lp PUBLIC

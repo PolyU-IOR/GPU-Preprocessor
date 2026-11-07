@@ -5,26 +5,219 @@
 #include "gpu_preprocessor/lp/offset.hpp"
 #include "gpu_preprocessor/lp/presolve/device_recovery.hpp"
 #include "gpu_preprocessor/lp/presolve/rules/rule_doubleton_equations.hpp"
-
-#include "doubleton_long_rows.cuh"
-#include "doubleton_live_offsets.cuh"
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#include <climits>
+#include <cstdint>
+#include <cstddef>
+#include <cmath>
 #include "gpu_preprocessor/lp/presolve/gpu_presolve_kernels.hpp"
 #include <cusparse.h>
 #include <thrust/device_ptr.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/sort.h>
-
 #include <algorithm>
-#include <cmath>
-#include <climits>
 #include <cstdlib>
-#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace gpu_preprocessor::lp::presolve::detail {
+
+constexpr int DOUBLETON_MERGE_THREADS = 256;
+constexpr int DOUBLETON_LONG_ROW_THRESHOLD = 4096;
+
+// Inputs have nondecreasing column indices. Partition only between complete
+// column groups: every coefficient retains source-first, delta-second serial
+// addition, including duplicate entries and the initial +0.0.
+struct DoubletonMergeRow {
+  const std::int32_t* cols;
+  const double* vals;
+  const long long* keys;
+  const double* deltas;
+  NnzOffset p_begin, p_end, q_begin, q_end;
+  std::int32_t n;
+
+  __device__ int dc(NnzOffset q) const { return static_cast<int>(keys[q] % n); }
+
+  __device__ void boundary(int lane, NnzOffset& p, NnzOffset& q) const {
+    if (lane == 0) { p = p_begin; q = q_begin; return; }
+    if (lane == DOUBLETON_MERGE_THREADS) { p = p_end; q = q_end; return; }
+    const NnzOffset pn = p_end - p_begin, qn = q_end - q_begin;
+    const std::int64_t rank = (static_cast<std::int64_t>(pn) + qn) * lane /
+                              DOUBLETON_MERGE_THREADS;
+    NnzOffset low = static_cast<NnzOffset>(rank > qn ? rank - qn : 0);
+    NnzOffset high = static_cast<NnzOffset>(rank < pn ? rank : pn);
+    NnzOffset i = low, j = static_cast<NnzOffset>(rank - i);
+    while (low <= high) {
+      i = low + (high - low) / 2;
+      j = static_cast<NnzOffset>(rank - i);
+      if (i > 0 && j < qn && cols[p_begin + i - 1] > dc(q_begin + j)) {
+        high = i - 1;
+      } else if (j > 0 && i < pn && dc(q_begin + j - 1) >= cols[p_begin + i]) {
+        low = i + 1;
+      } else {
+        break;
+      }
+    }
+    const int ac = i < pn ? cols[p_begin + i] : INT_MAX;
+    const int qc = j < qn ? dc(q_begin + j) : INT_MAX;
+    const int key = ac < qc ? ac : qc;
+    // Move both inputs to the first entry for this key. Repeated boundaries
+    // produce empty segments, never split a floating-point accumulation.
+    NnzOffset lo = p_begin, hi = p_end;
+    while (lo < hi) {
+      const NnzOffset mid = lo + (hi - lo) / 2;
+      if (cols[mid] < key) lo = mid + 1; else hi = mid;
+    }
+    p = lo;
+    lo = q_begin; hi = q_end;
+    while (lo < hi) {
+      const NnzOffset mid = lo + (hi - lo) / 2;
+      if (dc(mid) < key) lo = mid + 1; else hi = mid;
+    }
+    q = lo;
+  }
+
+  template<bool Write>
+  __device__ NnzOffset merge(NnzOffset p, NnzOffset p_stop,
+                            NnzOffset q, NnzOffset q_stop, double zero_tol,
+                            NnzOffset write = 0, int* out_cols = nullptr,
+                            double* out_vals = nullptr) const {
+    NnzOffset count = 0;
+    while (p < p_stop || q < q_stop) {
+      const int ac = p < p_stop ? cols[p] : INT_MAX;
+      const int qc = q < q_stop ? dc(q) : INT_MAX;
+      const int next = ac < qc ? ac : qc;
+      double merged = 0.0;
+      while (p < p_stop && cols[p] == next) merged += vals[p++];
+      while (q < q_stop && dc(q) == next) merged += deltas[q++];
+      if (fabs(merged) > zero_tol) {
+        if constexpr (Write) {
+          out_cols[write + count] = next;
+          out_vals[write + count] = merged;
+        }
+        ++count;
+      }
+    }
+    return count;
+  }
+};
+
+template<bool Write>
+__global__ void doubleton_merge_long_rows(
+    const NnzOffset* row_ptr, const int* cols, const double* vals,
+    const NnzOffset* delta_row_ptr, const long long* keys, const double* deltas,
+    const int* rows, const int* row_count, int n, double zero_tol,
+    NnzOffset* row_counts, NnzOffset* segment_counts,
+    const NnzOffset* out_row_ptr = nullptr, int* out_cols = nullptr,
+    double* out_vals = nullptr) {
+  using Scan = cub::BlockScan<NnzOffset, DOUBLETON_MERGE_THREADS>;
+  __shared__ typename Scan::TempStorage scan;
+  __shared__ NnzOffset ps[DOUBLETON_MERGE_THREADS + 1];
+  __shared__ NnzOffset qs[DOUBLETON_MERGE_THREADS + 1];
+  const int lane = threadIdx.x;
+  // Device-resident queue length avoids another host synchronization per batch.
+  for (int work = blockIdx.x; work < *row_count; work += gridDim.x) {
+    const int row = rows[work];
+    const DoubletonMergeRow input{cols, vals, keys, deltas,
+        row_ptr[row], row_ptr[row + 1], delta_row_ptr[row], delta_row_ptr[row + 1], n};
+    input.boundary(lane, ps[lane], qs[lane]);
+    if (lane == 0) input.boundary(DOUBLETON_MERGE_THREADS,
+                                ps[DOUBLETON_MERGE_THREADS], qs[DOUBLETON_MERGE_THREADS]);
+    __syncthreads();
+    const auto offset = static_cast<std::size_t>(work) * DOUBLETON_MERGE_THREADS + lane;
+    NnzOffset count;
+    if constexpr (Write) count = segment_counts[offset];
+    else {
+      count = input.merge<false>(ps[lane], ps[lane + 1], qs[lane], qs[lane + 1], zero_tol);
+      segment_counts[offset] = count;
+    }
+    NnzOffset prefix = 0, total = 0;
+    Scan(scan).ExclusiveSum(count, prefix, total);
+    if constexpr (Write) {
+      input.merge<true>(ps[lane], ps[lane + 1], qs[lane], qs[lane + 1], zero_tol,
+                        out_row_ptr[row] + prefix, out_cols, out_vals);
+    } else if (lane == 0) row_counts[row] = total;
+    __syncthreads();
+  }
+}
+
+}  // namespace gpu_preprocessor::lp::presolve::detail
+
+namespace gpu_preprocessor::lp::presolve::detail {
+
+// Sparse-storage positions use the selected offset ABI; row IDs remain int32.
+__device__ inline std::int32_t _doubleton_equations_next_live_col_row(const NnzOffset* row_ptr,
+                                                        const std::int32_t* col_val,
+                                                        const double* nz_val,
+                                                        const std::uint8_t* keep_row,
+                                                        double zero_tol,
+                                                        std::int32_t col,
+                                                        NnzOffset* pos) {
+  const NnzOffset stop = row_ptr[col + 1];
+  while (*pos < stop) {
+    const std::int32_t row = col_val[*pos];
+    const double val = nz_val[*pos];
+    if (keep_row[row] != std::uint8_t{0} && fabs(val) > zero_tol) {
+      return row;
+    }
+    ++(*pos);
+  }
+  return INT_MAX;
+}
+
+__device__ inline std::int32_t _doubleton_equations_fill_in_proxy_device_live(const NnzOffset* row_ptr,
+                                                                const std::int32_t* col_val,
+                                                                const double* nz_val,
+                                                                const std::uint8_t* keep_row,
+                                                                double zero_tol,
+                                                                std::int32_t keep_col,
+                                                                std::int32_t elim_col) {
+  std::int32_t fill_in = -1;
+  NnzOffset jj = row_ptr[keep_col];
+  const NnzOffset keep_stop = row_ptr[keep_col + 1];
+  NnzOffset kk = row_ptr[elim_col];
+  const NnzOffset elim_stop = row_ptr[elim_col + 1];
+  if (keep_stop <= jj || elim_stop <= kk) {
+    return fill_in;
+  }
+
+  while (jj < keep_stop && kk < elim_stop) {
+    NnzOffset jj_live = jj;
+    NnzOffset kk_live = kk;
+    const std::int32_t keep_row_j =
+        _doubleton_equations_next_live_col_row(row_ptr, col_val, nz_val, keep_row, zero_tol, keep_col, &jj_live);
+    const std::int32_t elim_row_k =
+        _doubleton_equations_next_live_col_row(row_ptr, col_val, nz_val, keep_row, zero_tol, elim_col, &kk_live);
+    if (keep_row_j == INT_MAX || elim_row_k == INT_MAX) {
+      break;
+    }
+    if (keep_row_j == elim_row_k) {
+      jj = jj_live + 1;
+      kk = kk_live + 1;
+    } else if (elim_row_k < keep_row_j) {
+      kk = kk_live + 1;
+      ++fill_in;
+    } else {
+      jj = jj_live + 1;
+    }
+  }
+  while (kk < elim_stop) {
+    NnzOffset kk_live = kk;
+    const std::int32_t elim_row_k =
+        _doubleton_equations_next_live_col_row(row_ptr, col_val, nz_val, keep_row, zero_tol, elim_col, &kk_live);
+    if (elim_row_k == INT_MAX) {
+      break;
+    }
+    ++fill_in;
+    kk = kk_live + 1;
+  }
+  return fill_in;
+}
+
+}  // namespace gpu_preprocessor::lp::presolve::detail
 
 namespace gpu_preprocessor::lp::presolve {
 namespace {
@@ -1310,7 +1503,6 @@ DeviceCsrMatrix build_doubleton_batch_new_A(const DeviceCsrMatrix& source,
   int* long_rows = nullptr;
   int* long_count = nullptr;
   NnzOffset* segment_counts = nullptr;
-
 
   throw_if_cuda_error(doubleton_cuda_malloc(&entry_counts, sizeof(NnzOffset) * static_cast<std::size_t>(selected_count)),
                       "cudaMalloc doubleton batch entry_counts");

@@ -1,7 +1,9 @@
 // Copyright (c) 2026 Kaihuang Chen, Jiawei Lu, Defeng Sun, Yancheng Yuan, Guojun Zhang, Xiangyu Zhang, Xinyuan Zhao
 // SPDX-License-Identifier: MIT
 
-#include "../src/presolve/rules/doubleton_long_rows.cuh"
+// Include the owning translation unit to test its internal merge kernel
+// against the independent serial reference without a separate helper file.
+#include "../src/presolve/rules/rule_doubleton_equations.cu"
 #include <algorithm>
 #include <cassert>
 #include <cstring>

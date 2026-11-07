@@ -140,7 +140,7 @@ It uses structure and values, never instance names. Dense-response and FFT
 memory gates fall back to ordinary presolve. Both host and device postprocess
 APIs restore primal variables, row duals and reduced costs through the retained
 inverse. Keep the original model, including its transpose, alive until recovery
-finishes. See [Poisson implementation and validation](lp/src/presolve/poisson/README.md).
+finishes. See [Poisson implementation and validation](lp/src/presolve/README.md#certified-poisson-startup-reduction).
 
 Further tuning fields: [PresolveParams](lp/include/gpu_preprocessor/lp/presolve/presolve_structs.hpp).
 For a command-line override:
