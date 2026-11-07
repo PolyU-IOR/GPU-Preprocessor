@@ -308,6 +308,7 @@ int main(int argc, char** argv) {
                                        "<model.mps|-> <solution_dir>", true);
       return 0;
     }
+    gpu_preprocessor::lp::tools::check_cuda(cudaSetDevice(options.device), "select CUDA device");
     const std::string input_path = options.positional[0];
     const std::filesystem::path solution_dir = options.positional[1];
     const auto& params = options.params;

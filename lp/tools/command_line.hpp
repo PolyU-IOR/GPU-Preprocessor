@@ -19,6 +19,7 @@ namespace gpu_preprocessor::lp::tools {
 struct CommandLine {
   presolve::PresolveParams params;
   std::vector<std::string> positional;
+  int device = 0;
   bool help = false;
   bool print_top_violations = false;
 };
@@ -57,7 +58,8 @@ inline CommandLine parse_command_line(int argc, const char* const* argv,
     }
     if (option != "--folding" && option != "--presolve" &&
         option != "--structure-specific" && option != "--max-iters" &&
-        option != "--max-time" && option != "--folding-tolerance" && option != "--verbose")
+        option != "--max-time" && option != "--folding-tolerance" && option != "--verbose" &&
+        option != "--gpu")
       throw std::invalid_argument("unknown option: " + option);
     if (++i == argc) throw std::invalid_argument("missing value for " + option);
     const std::string value = argv[i];
@@ -74,7 +76,8 @@ inline CommandLine parse_command_line(int argc, const char* const* argv,
       const auto status = std::from_chars(value.data(), end, parsed);
       if (status.ec != std::errc{} || status.ptr != end || parsed < 0)
         throw std::invalid_argument(option + " expects a nonnegative integer in int32 range");
-      p.max_iters = parsed;
+      if (option == "--gpu") result.device = parsed;
+      else p.max_iters = parsed;
     }
   }
   if (result.positional.size() != positional_count)
@@ -86,6 +89,7 @@ inline CommandLine parse_command_line(int argc, const char* const* argv,
 inline void print_usage(std::ostream& out, const char* tool, const char* paths,
                         bool allow_top_violations = false) {
   out << "usage: " << tool << ' ' << paths << " [options]\n"
+      << "  --gpu N                      Visible CUDA device index (default: 0)\n"
       << "  --folding true|false          Fold between Startup and Main (default: true)\n"
       << "  --presolve true|false         Enable presolve (default: true)\n"
       << "  --structure-specific true|false  Enable block reductions (default: true)\n"

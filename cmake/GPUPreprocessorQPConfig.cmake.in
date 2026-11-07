@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(GPUPreprocessor 2.0 CONFIG)
+if(TARGET GPUPreprocessor::qp AND NOT TARGET GPUPreprocessorQP::gpupresolve_qp)
+  add_library(GPUPreprocessorQP::gpupresolve_qp INTERFACE IMPORTED)
+  set_target_properties(GPUPreprocessorQP::gpupresolve_qp PROPERTIES INTERFACE_LINK_LIBRARIES GPUPreprocessor::qp)
+endif()
+check_required_components(GPUPreprocessorQP)

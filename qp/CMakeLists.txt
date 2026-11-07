@@ -1,0 +1,30 @@
+set(sources src/core/model.c src/core/kkt.c src/io/mps.c src/presolve/presolve.c
+    src/postsolve/tape.c src/postsolve/postsolve.c src/backend/cuda_products.cu
+    src/presolve/gpu_presolve.cu src/backend/cuda_postsolve.cu)
+add_library(gpupresolve_qp ${sources})
+add_library(GPUPreprocessorQP::gpupresolve_qp ALIAS gpupresolve_qp)
+add_library(GPUPreprocessor::qp ALIAS gpupresolve_qp)
+target_include_directories(gpupresolve_qp PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(gpupresolve_qp PRIVATE ZLIB::ZLIB m)
+set_target_properties(gpupresolve_qp PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2 EXPORT_NAME qp)
+warnings(gpupresolve_qp)
+target_compile_options(gpupresolve_qp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+set_target_properties(gpupresolve_qp PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_link_libraries(gpupresolve_qp PRIVATE CUDA::cudart_static)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(gpupresolve_qp PRIVATE stdc++)
+endif()
+if(GPUPREPROCESSOR_BUILD_QP)
+  if(BUILD_TOOLS)
+    add_subdirectory(tools)
+  endif()
+  if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
+  endif()
+  if(BUILD_TESTING)
+    add_subdirectory(tests)
+  endif()
+endif()

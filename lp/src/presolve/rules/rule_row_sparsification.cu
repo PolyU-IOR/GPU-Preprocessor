@@ -239,7 +239,7 @@ __global__ void init_lengths(int m,const std::int64_t* ptr,std::int64_t* lengths
         lengths[i]=i<m?ptr[i+1]-ptr[i]:0;
 }
 // One thread per independent first-column group, walking at most the bounded
-// eligible count. Ordered choices match the CPU reference without host scans.
+// eligible count and selecting chains in candidate order on the device.
 __global__ void select_chains(int count,const unsigned long long* keys,const Candidate* pairs,
                               const Decision* decisions,const std::int64_t* ptr,int cap,
                               int* parents,int* alpha,std::int64_t* lengths,Counters* stats) {

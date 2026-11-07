@@ -88,7 +88,7 @@ and compatible recovery semantics. Older projection-enabled references require
 numerical reassessment. Serial/parallel vector equality alone is not an
 optimality certificate; check the recovered point against the original LP.
 
-See [Tests](../../../../README.md#tests) for build commands. Regression coverage
+See [Tests](../../../README.md#tests) for build commands. Regression coverage
 includes joint/structural/projected KKT, parallel replay, packed/shared records,
 snapshots, Startup/folding handoffs, row-sparsification chains, ownership and the
 public interface, including cleanup after allocation and transfer failures.

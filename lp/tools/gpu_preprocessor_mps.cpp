@@ -18,9 +18,10 @@ int main(int argc, char** argv) {
     namespace tools = gpu_preprocessor::lp::tools;
     const auto options = tools::parse_command_line(argc, argv, 1);
     if (options.help) {
-      tools::print_usage(std::cout, "gpu_preprocessor_mps", "<model.mps|->");
+      tools::print_usage(std::cout, "gpu_preprocessor_lp", "<model.mps|->");
       return 0;
     }
+    tools::check_cuda(cudaSetDevice(options.device), "select CUDA device");
     const auto& params = options.params;
     const auto parse_start = Clock::now();
     auto model = tools::read_mps_file(options.positional[0]);

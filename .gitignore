@@ -18,6 +18,8 @@ reduced_lp/
 reduced/
 solution/
 reports/
+snapshots/
+diagnostic_snapshots/
 .codex/
 .sync-tools/
 *.o
@@ -33,3 +35,13 @@ reports/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local datasets, dependencies and profiling outputs
+**/.deps/
+/data/
+/datasets/
+/benchmarks/
+/solutions/
+*.gcda
+*.gcno
+*.profraw

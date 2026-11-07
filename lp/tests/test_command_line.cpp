@@ -27,6 +27,9 @@ int main() {
   const auto base = parse({"tool", "model.mps"});
   assert(base.params.enable_folding && base.params.enable_presolve);
   assert(base.params.max_iters == 512 && std::isinf(base.params.max_time));
+  assert(base.device == 0);
+  assert(parse({"tool", "--gpu", "2", "model.mps"}).device == 2);
+  assert(parse({"tool", "model.mps", "--gpu", "3"}).device == 3);
 
   for (bool checking : {false, true}) {
     const auto defaults = parse({"tool", "model.mps", "output/"}, 2, checking);
@@ -62,8 +65,10 @@ int main() {
   rejects({"tool", "model.mps", "--folding"});
   rejects({"tool", "model.mps", "--folding", "maybe"});
   rejects({"tool", "model.mps", "--print-top-violations"});
-  for (const char* value : {"", "-1", "2147483648", "1.5", "2junk"})
-    rejects({"tool", "model.mps", "--max-iters", value});
+  rejects({"tool", "model.mps", "--gpu"});
+  for (const char* flag : {"--max-iters", "--gpu"})
+    for (const char* value : {"", "-1", "2147483648", "1.5", "2junk"})
+      rejects({"tool", "model.mps", flag, value});
   for (const char* flag : {"--max-time", "--folding-tolerance"})
     for (const char* value : {"", "-1", "nan", "inf", "1e999", "1junk"})
       rejects({"tool", "model.mps", flag, value});
@@ -71,6 +76,7 @@ int main() {
   std::ostringstream help;
   tools::print_usage(help, "tool", "<model> <solution>", true);
   assert(help.str().find("--max-iters") != std::string::npos);
+  assert(help.str().find("--gpu") != std::string::npos);
   assert(help.str().find("--print-top-violations") != std::string::npos);
   std::cout << "Command-line parsing passed\n";
 }

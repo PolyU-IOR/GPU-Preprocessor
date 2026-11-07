@@ -29,10 +29,18 @@ ENDATA
 with tempfile.TemporaryDirectory(prefix="mps-tool-report-") as directory:
     path = Path(directory) / "bounds.mps"
     path.write_text(model)
+    for binary in sys.argv[1:]:
+        help_result = subprocess.run([binary, "--help"], text=True, capture_output=True, timeout=10)
+        assert help_result.returncode == 0 and "--gpu" in help_result.stdout, help_result.stderr
+        # Only device zero is visible under the test runner. All LP tools must
+        # honor --gpu instead of silently executing on the default device.
+        args = [binary, str(path)] + ([] if binary == sys.argv[1] else [str(Path(directory) / "unused")])
+        invalid = subprocess.run(args + ["--gpu", "2147483647"], text=True, capture_output=True, timeout=10)
+        assert invalid.returncode == 2 and "select CUDA device" in invalid.stderr, invalid.stdout + invalid.stderr
     for enabled in (False, True):
         env = os.environ.copy()
         result = subprocess.run(
-            [sys.argv[1], str(path), "--folding", "false", "--max-iters", "2", "--presolve", str(enabled).lower()],
+            [sys.argv[1], str(path), "--gpu", "0", "--folding", "false", "--max-iters", "2", "--presolve", str(enabled).lower()],
             env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
         fields = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)

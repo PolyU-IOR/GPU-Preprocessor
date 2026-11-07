@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(QPExample LANGUAGES C)
+  include(GNUInstallDirs)
+  find_package(GPUPreprocessor CONFIG REQUIRED COMPONENTS qp)
+endif()
+add_executable(presolve_example presolve_example.c)
+target_link_libraries(presolve_example PRIVATE GPUPreprocessor::qp m)
+set_target_properties(presolve_example PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+file(RELATIVE_PATH INSTALL_EXAMPLE_RELATIVE "${CMAKE_INSTALL_FULL_BINDIR}"
+  "${CMAKE_INSTALL_FULL_DATADIR}/GPUPreprocessor/qp/examples/qp_fixed.mps")
+target_compile_definitions(presolve_example PRIVATE
+  EXAMPLE_MPS="${CMAKE_CURRENT_SOURCE_DIR}/qp_fixed.mps"
+  INSTALL_EXAMPLE_RELATIVE="${INSTALL_EXAMPLE_RELATIVE}")
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  warnings(presolve_example)
+  application_runtime(presolve_example)
+  if(BUILD_TESTING)
+    add_test(NAME example_gpu COMMAND presolve_example --gpu)
+    set_tests_properties(example_gpu PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+  endif()
+endif()

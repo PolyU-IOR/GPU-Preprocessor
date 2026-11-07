@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.24)
+project(InstalledComponents LANGUAGES CXX)
+find_package(GPUPreprocessor CONFIG REQUIRED COMPONENTS lp qp)
+add_executable(components ../component_link.cpp)
+target_link_libraries(components PRIVATE GPUPreprocessor::lp GPUPreprocessor::qp)

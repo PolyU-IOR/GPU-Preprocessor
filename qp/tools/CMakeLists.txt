@@ -1,0 +1,5 @@
+add_executable(presolve presolve.c)
+set_target_properties(presolve PROPERTIES OUTPUT_NAME gpu_preprocessor_qp)
+target_link_libraries(presolve PRIVATE GPUPreprocessorQP::gpupresolve_qp)
+warnings(presolve)
+application_runtime(presolve)
