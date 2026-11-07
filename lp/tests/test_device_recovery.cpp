@@ -261,7 +261,10 @@ static void projected_record_formats() {
     add(format != 0, true); add(format == 1, false);
     if (resident) {
       initialize_device_recovery(r);
-      cudaFree(r.device->rows.data); cudaFree(r.device->cols.data);
+      // Initialization enqueues writes into stream-ordered allocations.
+      // Retire them on that stream before replacing the map descriptors.
+      check(cudaFreeAsync(r.device->rows.data, 0));
+      check(cudaFreeAsync(r.device->cols.data, 0));
       r.device->rows.data = device(r.row_red2org); r.device->rows.count = r.m1;
       r.device->cols.data = device(r.col_red2org); r.device->cols.count = r.n1;
       flush_host_recovery_segment(r.tape);
