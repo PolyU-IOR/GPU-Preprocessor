@@ -25,7 +25,7 @@ subject to  AL ≤ Ax ≤ AU
 ## Installation
 
 Requires Linux, Make, CMake 3.24+, a C++17 compiler, CUDA Toolkit 12+ (nvcc and
-cuSPARSE and cuBLAS), and an NVIDIA GPU. The paper experiments used CUDA Toolkit 13.3.33.
+cuSPARSE, cuBLAS and cuFFT), and an NVIDIA GPU. The paper experiments used CUDA Toolkit 13.3.33.
 Run from the project root:
 
 ```sh
@@ -118,6 +118,7 @@ Set these fields in `gpu_preprocessor::lp::Parameters` when calling the C++ API:
 | `max_iters` | `512` | Presolve scheduler iteration budget |
 | `max_time` | `∞` | Soft presolve time limit in seconds, checked between phases |
 | `enable_startup` | `true` | Enable the Startup presolve stage before folding and Main |
+| `startup_poisson` | `presolve::run_startup_poisson` | Built-in certified Poisson reduction; `nullptr` disables it |
 
 Set `enable_folding = false` to run presolve only, or `enable_presolve = false`
 to run folding only.
@@ -125,6 +126,22 @@ Set `enable_startup = false` to skip Startup while retaining folding and Main.
 Startup and Main share the presolve iteration/time budget. Without folding,
 they use one recovery record. Rebuild the library and callers together when
 updating.
+Startup runs row sparsification, then the built-in 3-D Dirichlet Poisson
+reduction, followed by the other structural rules. **A successful Poisson
+reduction skips folding** and continues into Main with `zero_tol = 0` to retain
+small nonzero Green-response coefficients. A miss leaves ordinary folding and
+Main unchanged. Set `GPUPREPROCESSOR_POISSON_PRESOLVE=0` to disable the built-in
+strategy from the environment (unset or `1` enables it); a custom
+`startup_poisson` callback retains control of its own policy.
+
+The Poisson certificate checks the complete seven-point stencil with source
+columns, homogeneous Dirichlet boundary, observation bounds and objective.
+It uses structure and values, never instance names. Dense-response and FFT
+memory gates fall back to ordinary presolve. Both host and device postprocess
+APIs restore primal variables, row duals and reduced costs through the retained
+inverse. Keep the original model, including its transpose, alive until recovery
+finishes. See [Poisson implementation and validation](lp/src/presolve/poisson/README.md).
+
 Further tuning fields: [PresolveParams](lp/include/gpu_preprocessor/lp/presolve/presolve_structs.hpp).
 For a command-line override:
 

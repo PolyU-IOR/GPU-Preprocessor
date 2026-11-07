@@ -50,11 +50,15 @@ The `.cuh` handlers are inlined into the replay kernels. The `.cu` files own
 structural primal kernels and the row-sparsification adjoint. Both `.inc.cu`
 fragments are included by `../gpu_postsolve.cu`, never compiled separately.
 
-Startup recovery first invokes an optional application-owned Poisson inverse,
-then applies the row-sparsification adjoint `y = S^T y'`. Standalone builds
-provide the Poisson callback contract, not a native implementation; the callback
-is null by default. A provider must supply both the forward transform and its
-x/y/z inverse.
+Startup recovery first invokes the retained Poisson inverse, then applies the
+row-sparsification adjoint `y = S^T y'`. The built-in implementation in
+[`../poisson/`](../poisson/README.md) is enabled by default. It reconstructs
+temperatures and row duals through cuFFT, scatters source values and reduced
+costs, and computes fixed-variable duals from the original transpose. Recovery
+allocation failures propagate without returning a partially restored point.
+Custom providers may still replace the forward transform and its x/y/z inverse.
+Successful Poisson reductions bypass folding, so their default recovery order
+is Main, ordinary Startup replay, Poisson inverse, then the row adjoint.
 
 ## Parallel replay and diagnostics
 

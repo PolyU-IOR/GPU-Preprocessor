@@ -7,6 +7,8 @@ add_library(gpu_preprocessor_lp STATIC
   src/folding/folding_map.cu
   src/folding/folding_reduce.cu
   src/folding/folding_refinement.cu
+  src/presolve/poisson/poisson.cu
+  src/presolve/poisson/kernels.cu
   src/presolve/transpose64.cu
   src/presolve/device_recovery.cu
   src/presolve/identity_plan.cu
@@ -47,7 +49,7 @@ target_include_directories(gpu_preprocessor_lp PUBLIC
 target_compile_features(gpu_preprocessor_lp PUBLIC cxx_std_17 cuda_std_17)
 target_compile_definitions(gpu_preprocessor_lp PUBLIC
   GPUPREPROCESSOR_USE_INT64_NNZ=$<BOOL:${GPUPREPROCESSOR_USE_INT64_NNZ}>)
-target_link_libraries(gpu_preprocessor_lp PUBLIC CUDA::cudart CUDA::cusparse CUDA::cublas Threads::Threads)
+target_link_libraries(gpu_preprocessor_lp PUBLIC CUDA::cudart CUDA::cusparse CUDA::cublas CUDA::cufft Threads::Threads)
 set_target_properties(gpu_preprocessor_lp PROPERTIES
   EXPORT_NAME lp OUTPUT_NAME gpu_preprocessor_lp POSITION_INDEPENDENT_CODE ON
   CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
@@ -100,6 +102,7 @@ if(GPUPREPROCESSOR_BUILD_TOOLS)
 endif()
 if(GPUPREPROCESSOR_BUILD_TESTS)
   add_executable(test_command_line tests/test_command_line.cpp)
+  target_link_libraries(test_command_line PRIVATE GPUPreprocessor::lp)
   target_include_directories(test_command_line PRIVATE include)
   target_compile_features(test_command_line PRIVATE cxx_std_17)
   target_compile_definitions(test_command_line PRIVATE
@@ -109,6 +112,10 @@ if(GPUPREPROCESSOR_BUILD_TESTS)
 endif()
 
 if(GPUPREPROCESSOR_BUILD_TESTS)
+  add_executable(test_poisson_startup tests/test_poisson_startup.cpp tools/postsolve_replay/kkt.cu)
+  target_link_libraries(test_poisson_startup PRIVATE GPUPreprocessor::lp)
+  target_link_options(test_poisson_startup PRIVATE "-Wl,--wrap=cudaMalloc")
+  add_test(NAME test_poisson_startup COMMAND test_poisson_startup)
   add_executable(test_postsolve_kkt tests/test_postsolve_kkt.cpp tools/postsolve_replay/kkt.cu)
   target_link_libraries(test_postsolve_kkt PRIVATE GPUPreprocessor::lp)
   target_compile_options(test_postsolve_kkt PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)

@@ -27,6 +27,8 @@ enum class PiecewiseLinearReformulationAbsoluteValueResidualBoundMode : std::uin
 
 struct LPInfoGpu;
 struct StartupPoissonReduction;
+// Certified 3-D Dirichlet Poisson reduction. A miss leaves input unchanged.
+std::shared_ptr<StartupPoissonReduction> run_startup_poisson(const LPInfoGpu& input);
 
 struct PresolveParams {
   int max_iters = 512;
@@ -159,9 +161,9 @@ struct PresolveParams {
   void (*prepare_startup_column_access)(LPInfoGpu&, void*) = nullptr;
   void* startup_column_access_context = nullptr;
   bool defer_startup_row_transpose = false;
-  // Adapter-supplied native Poisson strategy, executed after row sparsification.
-  // Null in standalone builds. Miss leaves the input and recovery maps intact.
-  std::shared_ptr<StartupPoissonReduction> (*startup_poisson)(const LPInfoGpu&) = nullptr;
+  // Built-in Poisson strategy, executed after row sparsification. Set nullptr
+  // to disable or supply a custom strategy. Miss preserves the input/maps.
+  std::shared_ptr<StartupPoissonReduction> (*startup_poisson)(const LPInfoGpu&) = run_startup_poisson;
   // Exact equality-row differences, once at the start of Startup. Detection,
   // certification, materialization and the adjoint inverse run on the GPU.
   bool enable_row_sparsification = true;
@@ -426,8 +428,8 @@ struct GpuPostsolveResult {
   std::int32_t m0 = 0;
 };
 
-// Owns the immutable response LP and the native inverse without introducing
-// application model types or FFT dependencies into standalone presolve.
+// Owns the immutable response LP and inverse. Public headers do not expose
+// FFT or application model types; custom strategies retain the same contract.
 struct StartupPoissonReduction {
   LPInfoGpu transformed;
   virtual ~StartupPoissonReduction() = default;

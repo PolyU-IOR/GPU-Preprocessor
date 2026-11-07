@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -240,11 +241,17 @@ static FoldingPipelineSummary run_gpu_presolve_with_folding_impl(const presolve:
   main_params.startup_column_access_context = nullptr;
   main_params.defer_startup_row_transpose = false;
   const bool poisson_response = summary.startup && summary.startup->summary.record.startup_poisson;
-  // Green response entries can be tiny but multiply large source values.
-  // Do not silently discard their contribution in folding or Main activities.
-  if (poisson_response) main_params.zero_tol = 0.0;
-  summary.folding = run_folding(*folding_input, params.folding_tolerance,
-                                params.verbose, poisson_response);
+  if (poisson_response) {
+    // Tiny Green responses can collide under ordinary folding signatures.
+    // Keep the certified response and its inverse, and continue directly to
+    // Main without discarding any nonzero response coefficients.
+    main_params.zero_tol = 0.0;
+    summary.folding.original_rows = summary.folding.folded_rows = folding_input->A.rows;
+    summary.folding.original_cols = summary.folding.folded_cols = folding_input->A.cols;
+    std::cout << "FOLDING skip=startup_poisson_applied\n";
+  } else {
+    summary.folding = run_folding(*folding_input, params.folding_tolerance, params.verbose);
+  }
   summary.folding_applied = summary.folding.applied;
   summary.folded_rows = summary.folding.folded_rows;
   summary.folded_cols = summary.folding.folded_cols;
