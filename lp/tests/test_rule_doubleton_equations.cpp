@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "gpu_preprocessor/lp/offset.hpp"
+#include "gpu_preprocessor/lp/presolve/gpu_presolve.hpp"
 #include "gpu_preprocessor/lp/presolve/rules/rule_doubleton_equations.hpp"
 
 #include <cuda_runtime.h>
@@ -38,6 +39,14 @@ std::vector<T> copy_to_host(T* device, std::size_t size) {
   check(cudaMemcpy(values.data(), device, sizeof(T) * size, cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H");
   return values;
+}
+
+void free_rewritten_matrix(gpu_preprocessor::lp::presolve::PresolvePlanGpu& plan) {
+  if (!plan.has_new_A) return;
+  // Matrix construction uses stream-ordered allocations and queued kernels.
+  check(cudaFreeAsync(plan.new_A.rowPtr, 0), "cudaFreeAsync rewritten row pointers");
+  check(cudaFreeAsync(plan.new_A.colVal, 0), "cudaFreeAsync rewritten columns");
+  check(cudaFreeAsync(plan.new_A.nzVal, 0), "cudaFreeAsync rewritten values");
 }
 
 }  // namespace
@@ -171,11 +180,7 @@ void test_batch_records_exact_doubleton_tape() {
   cudaFree(plan.new_u);
   cudaFree(plan.new_AL);
   cudaFree(plan.new_AU);
-  if (plan.has_new_A) {
-    cudaFree(plan.new_A.rowPtr);
-    cudaFree(plan.new_A.colVal);
-    cudaFree(plan.new_A.nzVal);
-  }
+  free_rewritten_matrix(plan);
 }
 
 bool run_doubleton_fill_cap_case(int max_fill_in_proxy) {
@@ -272,11 +277,7 @@ bool run_doubleton_fill_cap_case(int max_fill_in_proxy) {
   cudaFree(plan.new_u);
   cudaFree(plan.new_AL);
   cudaFree(plan.new_AU);
-  if (plan.has_new_A) {
-    cudaFree(plan.new_A.rowPtr);
-    cudaFree(plan.new_A.colVal);
-    cudaFree(plan.new_A.nzVal);
-  }
+  free_rewritten_matrix(plan);
   return changed;
 }
 
@@ -335,9 +336,62 @@ void test_one_batch_leaves_conflicting_equation_for_later() {
   cudaFree(plan.keep_row_mask); cudaFree(plan.keep_col_mask);
   cudaFree(plan.new_c); cudaFree(plan.new_l); cudaFree(plan.new_u);
   cudaFree(plan.new_AL); cudaFree(plan.new_AU);
-  if (plan.has_new_A) {
-    cudaFree(plan.new_A.rowPtr); cudaFree(plan.new_A.colVal); cudaFree(plan.new_A.nzVal);
+  free_rewritten_matrix(plan);
+}
+
+void test_objective_cancellation(bool batch, double cost0, double cost1,
+                                 double expected_cost, double rhs, bool pipeline = false) {
+  using namespace gpu_preprocessor::lp::presolve;
+  const double inf = std::numeric_limits<double>::infinity();
+  // 10*x0 - 3*x1 = rhs, x0 + x2 >= 1, x1 + x3 >= 0.
+  // With costs (1e7, -3e6), the objective is 1e6*rhs + x2 + x3.
+  // Both free columns have degree two; substitution keeps x0.
+  LPInfoGpu lp;
+  lp.A = {3, 4, 6, copy_to_device<NnzOffset>({0, 2, 4, 6}),
+          copy_to_device<std::int32_t>({0, 1, 0, 2, 1, 3}),
+          copy_to_device<double>({10.0, -3.0, 1.0, 1.0, 1.0, 1.0})};
+  lp.AT = {4, 3, 6, copy_to_device<NnzOffset>({0, 2, 4, 5, 6}),
+           copy_to_device<std::int32_t>({0, 1, 0, 2, 1, 2}),
+           copy_to_device<double>({10.0, 1.0, -3.0, 1.0, 1.0, 1.0})};
+  PresolvePlanGpu plan;
+  plan.keep_row_mask = copy_to_device<std::uint8_t>({1, 1, 1});
+  plan.keep_col_mask = copy_to_device<std::uint8_t>({1, 1, 1, 1});
+  lp.c = plan.new_c = copy_to_device<double>({cost0, cost1, 1.0, 1.0});
+  lp.l = plan.new_l = copy_to_device<double>({-inf, -inf, 0.0, 0.0});
+  lp.u = plan.new_u = copy_to_device<double>({inf, inf, inf, inf});
+  lp.AL = plan.new_AL = copy_to_device<double>({rhs, 1.0, 0.0});
+  lp.AU = plan.new_AU = copy_to_device<double>({rhs, inf, inf});
+  PresolveStatsGpu stats;
+  PresolveParams params;
+  params.doubleton_equations_scan = batch;
+  params.doubleton_equations_min_selected_per_batch = 1;
+  params.doubleton_equations_min_selected_ratio = 0.0;
+  if (pipeline) {
+    auto summary = run_gpu_presolve_with_reduced_lp(lp, params);
+    assert(!summary.has_infeasible && !summary.has_unbounded);
+    free_gpu_presolve_reduced_lp(summary);
+  } else {
+    apply_rule_doubleton_equations(plan, lp, stats, params);
+    const auto keep = copy_to_host(plan.keep_col_mask, 4);
+    const auto costs = copy_to_host(plan.new_c, 4);
+    assert(keep[0] == 1 && keep[1] == 0);
+    assert(copy_to_host(plan.keep_row_mask, 3)[0] == 0);
+    assert(plan.has_change && !plan.has_unbounded && !plan.has_infeasible);
+    if (expected_cost == 0.0) {
+      assert(costs[0] == 0.0);
+    } else {
+      assert(costs[0] != 0.0);
+      assert(std::fabs(costs[0] - expected_cost) <= 1.0e-12 * std::fabs(expected_cost));
+    }
+    assert(costs[2] == 1.0 && costs[3] == 1.0);
+    assert(plan.obj_constant_delta == cost1 * (-rhs / 3.0));
   }
+  cudaFree(lp.A.rowPtr); cudaFree(lp.A.colVal); cudaFree(lp.A.nzVal);
+  cudaFree(lp.AT.rowPtr); cudaFree(lp.AT.colVal); cudaFree(lp.AT.nzVal);
+  cudaFree(plan.keep_row_mask); cudaFree(plan.keep_col_mask);
+  cudaFree(plan.new_c); cudaFree(plan.new_l); cudaFree(plan.new_u);
+  cudaFree(plan.new_AL); cudaFree(plan.new_AU);
+  free_rewritten_matrix(plan);
 }
 
 int main() {
@@ -345,6 +399,27 @@ int main() {
   test_batch_records_exact_doubleton_tape();
   test_default_fill_cap_accepts_more_than_ten();
   test_one_batch_leaves_conflicting_equation_for_later();
+  for (bool batch : {false, true}) {
+    test_objective_cancellation(batch, 1.0e7, -3.0e6, 0.0, 0.0);
+    test_objective_cancellation(batch, 1.0e7, -3.0e6, 0.0, 6.0);
+    test_objective_cancellation(batch, 1.0e-12, -3.0e-13, 0.0, 0.0);
+    for (double gap : {-5.0e-4, 5.0e-4}) {
+      test_objective_cancellation(batch, 1.0e7 + gap, -3.0e6, 0.0, 0.0);
+    }
+    for (double gap : {-2.0e-3, 2.0e-3}) {
+      const double cost0 = 1.0e7 + gap;
+      test_objective_cancellation(batch, cost0, -3.0e6,
+                                 std::fma(-3.0e6, 10.0 / 3.0, cost0), 0.0);
+    }
+    test_objective_cancellation(batch, 1.0e-12 * (1.0 + 5.0e-11), -3.0e-13,
+                               0.0, 0.0);
+    const double small_cost = 1.0e-12 * (1.0 + 2.0e-10);
+    test_objective_cancellation(batch, small_cost, -3.0e-13,
+                               std::fma(-3.0e-13, 10.0 / 3.0, small_cost), 0.0);
+    test_objective_cancellation(batch, 0.0, 3.0e-12, 1.0e-11, 0.0);
+    test_objective_cancellation(batch, 1.0e7, -3.0e6, 0.0, 0.0, true);
+  }
+  check(cudaDeviceSynchronize(), "finish doubleton tests");
   std::cout << "test_rule_doubleton_equations passed\n";
   return 0;
 }

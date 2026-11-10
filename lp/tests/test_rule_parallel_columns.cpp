@@ -240,7 +240,8 @@ void test_bounded_objective_prefilter() {
     plan.new_AL=copy_to_device(std::vector<double>(m,0.0));plan.new_AU=copy_to_device(std::vector<double>(m,10.0));
     PresolveStatsGpu stats;apply_rule_parallel_columns(plan,lp,stats,params);
     auto keep=copy_to_host(plan.keep_col_mask,2);
-    if(gap>tol){assert(keep[0]==1 && keep[1]==1);assert(!plan.has_change && plan.tape.types.empty());}
+    // Even a fraction of bound_tol is a genuine objective mismatch here.
+    if(gap!=0.0){assert(keep[0]==1 && keep[1]==1);assert(!plan.has_change && plan.tape.types.empty());}
     else {
       assert(keep[0]==1 && keep[1]==0);assert(plan.has_change && plan.tape.types.size()==1);
       assert((plan.tape.indices==std::vector<int>{1,0}));
@@ -515,6 +516,109 @@ void test_small_coefficients_do_not_hide_nonproportional_columns() {
   else unsetenv("GPUPREPROCESSOR_PARALLEL_COLUMNS_PREVERIFY");
 }
 
+void test_small_cost_gap_fixes_the_correct_bound() {
+  using namespace gpu_preprocessor::lp::presolve;
+  const double inf = std::numeric_limits<double>::infinity();
+  for (double cost : {-4.0e-7, 4.0e-7}) {
+    LPInfoGpu lp;
+    lp.A.rows = 2; lp.A.cols = 2;
+    lp.AT = {2, 2, 4, copy_to_device<NnzOffset>({0, 2, 4}),
+             copy_to_device<std::int32_t>({0, 1, 0, 1}),
+             copy_to_device<double>({1.0, 2.0, 1.0, 2.0})};
+    PresolvePlanGpu plan;
+    plan.keep_row_mask = copy_to_device<std::uint8_t>({1, 1});
+    plan.keep_col_mask = copy_to_device<std::uint8_t>({1, 1});
+    plan.new_c = copy_to_device<double>({0.0, cost});
+    plan.new_l = copy_to_device<double>({-inf, 3.0});
+    plan.new_u = copy_to_device<double>({inf, 5.0});
+    plan.new_AL = copy_to_device<double>({0.0, 0.0});
+    plan.new_AU = copy_to_device<double>({10.0, 20.0});
+    PresolveStatsGpu stats;
+    PresolveParams params;
+    apply_rule_parallel_columns(plan, lp, stats, params);
+    const double fixed = cost > 0.0 ? 3.0 : 5.0;
+    assert((copy_to_host(plan.keep_col_mask, 2) == std::vector<std::uint8_t>{1, 0}));
+    assert(copy_to_host(plan.new_l, 2)[1] == fixed);
+    assert(copy_to_host(plan.new_u, 2)[1] == fixed);
+    assert(plan.obj_constant_delta == cost * fixed);
+    assert((plan.tape.types == std::vector<std::int32_t>{
+        static_cast<std::int32_t>(PostsolveReductionType::FixedVariable)}));
+    assert(!plan.has_unbounded && !plan.has_infeasible);
+    cudaFree(lp.AT.rowPtr); cudaFree(lp.AT.colVal); cudaFree(lp.AT.nzVal);
+    cudaFree(plan.keep_row_mask); cudaFree(plan.keep_col_mask);
+    cudaFree(plan.new_c); cudaFree(plan.new_l); cudaFree(plan.new_u);
+    cudaFree(plan.new_AL); cudaFree(plan.new_AU);
+  }
+}
+
+void test_parallel_costs_require_relative_agreement() {
+  using namespace gpu_preprocessor::lp::presolve;
+  const double inf = std::numeric_limits<double>::infinity();
+  struct Case { double target, source, ratio; bool merge; };
+  const Case cases[] = {
+      {0.0, -4.0e-7, 1.0, false},
+      {1.0, 1.0 + 4.0e-7, 1.0, false},
+      {1.0e-8, 1.0e-8 + 4.0e-15, 1.0, false},
+      {1.0, 1.0 + 5.0e-11, 1.0, true},
+      {1.0, 1.0 + 2.0e-10, 1.0, false},
+      {1.0e-8, 1.0e-8 + 5.0e-19, 1.0, true},
+      {1.0e-8, 1.0e-8 + 2.0e-18, 1.0, false},
+      {1.0e7, 1.0e7 + 5.0e-4, 1.0, true},
+      {1.0e7, 1.0e7 + 2.0e-3, 1.0, false},
+      {1.0, std::nextafter(2.0, inf), 2.0, true},
+      {1.0e-200, 2.0e-200, 2.0, true},
+      {0.0, 0.0, -2.0, true},
+      {1.0, -2.0, -2.0, true},
+      {1.0, -2.0 - 4.0e-7, -2.0, false},
+      {std::numeric_limits<double>::max(), std::numeric_limits<double>::max(), 2.0, false},
+      {std::numeric_limits<double>::denorm_min(), 0.0, 0.25, false}};
+  // With both columns bounded, costs outside the relative tolerance must
+  // retain both variables. Exercise either side of the tolerance at each scale.
+  // A large box makes a small cost mismatch significant in the objective.
+  for (const char* verify : {"0", "1"}) {
+    setenv("GPUPREPROCESSOR_PARALLEL_COLUMNS_PREVERIFY", verify, 1);
+    for (int m : {2, 2049}) for (const auto& item : cases) {
+      std::vector<std::int32_t> rows(2 * m);
+      std::vector<double> values(2 * m);
+      for (int i = 0; i < m; ++i) {
+        rows[i] = rows[m + i] = i;
+        values[i] = 1.0;
+        values[m + i] = item.ratio;
+      }
+      LPInfoGpu lp;
+      lp.A.rows = m; lp.A.cols = 2;
+      lp.AT = {2, m, 2 * m, copy_to_device<NnzOffset>({0, m, 2 * m}),
+               copy_to_device(rows), copy_to_device(values)};
+      PresolvePlanGpu plan;
+      plan.keep_row_mask = copy_to_device(std::vector<std::uint8_t>(m, 1));
+      plan.keep_col_mask = copy_to_device<std::uint8_t>({1, 1});
+      plan.new_c = copy_to_device<double>({item.target, item.source});
+      plan.new_l = copy_to_device<double>({0.0, 0.0});
+      plan.new_u = copy_to_device<double>({1.0e8, 1.0e8});
+      plan.new_AL = copy_to_device(std::vector<double>(m, 1.0e8));
+      plan.new_AU = copy_to_device(std::vector<double>(m, 1.0e8));
+      PresolveStatsGpu stats;
+      PresolveParams params;
+      apply_rule_parallel_columns(plan, lp, stats, params);
+      const auto keep = copy_to_host(plan.keep_col_mask, 2);
+      assert(keep[0] == 1 && keep[1] == (item.merge ? 0 : 1));
+      assert(!plan.has_unbounded && !plan.has_infeasible);
+      assert(plan.has_change == item.merge);
+      assert(plan.tape.types.size() == (item.merge ? 1u : 0u));
+      const auto costs = copy_to_host(plan.new_c, 2);
+      assert(costs[0] == item.target && costs[1] == item.source);
+      if (!item.merge) {
+        assert((copy_to_host(plan.new_l, 2) == std::vector<double>{0.0, 0.0}));
+        assert((copy_to_host(plan.new_u, 2) == std::vector<double>{1.0e8, 1.0e8}));
+      }
+      cudaFree(lp.AT.rowPtr); cudaFree(lp.AT.colVal); cudaFree(lp.AT.nzVal);
+      cudaFree(plan.keep_row_mask); cudaFree(plan.keep_col_mask);
+      cudaFree(plan.new_c); cudaFree(plan.new_l); cudaFree(plan.new_u);
+      cudaFree(plan.new_AL); cudaFree(plan.new_AU);
+    }
+  }
+}
+
 int main() {
   const char* old=std::getenv("GPUPREPROCESSOR_P1_PARALLEL_COLUMNS_PREFILTER");
   const std::string saved=old?old:"0";
@@ -533,6 +637,8 @@ int main() {
     test_ratio_guard_keeps_scaled_parallel_columnumns();
     test_bounded_objective_prefilter();
     test_small_coefficients_do_not_hide_nonproportional_columns();
+    test_parallel_costs_require_relative_agreement();
+    test_small_cost_gap_fixes_the_correct_bound();
     for (bool masked : {false, true})
       for (bool device_tape : {false, true})
         test_parallel_large_group_matches_serial(masked, device_tape);

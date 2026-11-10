@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Kaihuang Chen, Jiawei Lu, Defeng Sun, Yancheng Yuan, Guojun Zhang, Xiangyu Zhang, Xinyuan Zhao
 // SPDX-License-Identifier: MIT
 
+#include "../objective_roundoff.cuh"
 #include "gpu_preprocessor/lp/detail/runtime_options.hpp"
 #include "gpu_preprocessor/lp/offset.hpp"
 #include "gpu_preprocessor/lp/presolve/device_recovery.hpp"
@@ -630,7 +631,7 @@ __global__ void _kernel_doubleton_equations_apply(std::int32_t* status,
   if (t == 0) {
     l[keep_col] = keep_l_new;
     u[keep_col] = keep_u_new;
-    c[keep_col] += elim_obj * alpha;
+    c[keep_col] = detail::substituted_objective_coefficient(c[keep_col], elim_obj, alpha);
     keep_row_mask[target_row] = std::uint8_t{0};
     keep_col_mask[elim_col] = std::uint8_t{0};
     atomicAdd(obj_delta, elim_obj * beta);
@@ -1244,7 +1245,7 @@ __global__ void _kernel_apply_doubleton_equations_batch(std::int32_t* status,
   } else {
     l[keep] = keep_l_new;
     u[keep] = keep_u_new;
-    c[keep] += old_c[elim] * alpha;
+    c[keep] = detail::substituted_objective_coefficient(c[keep], old_c[elim], alpha);
     keep_row_mask[row] = std::uint8_t{0};
     keep_col_mask[elim] = std::uint8_t{0};
     subst_pair_mask[t] = std::uint8_t{1};

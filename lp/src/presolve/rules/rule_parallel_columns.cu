@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Kaihuang Chen, Jiawei Lu, Defeng Sun, Yancheng Yuan, Guojun Zhang, Xiangyu Zhang, Xinyuan Zhao
 // SPDX-License-Identifier: MIT
 
+#include "../objective_roundoff.cuh"
 #include "../parallel_signature_common.cuh"
 #include "gpu_preprocessor/lp/detail/runtime_options.hpp"
 #include "gpu_preprocessor/lp/offset.hpp"
@@ -329,7 +330,7 @@ __global__ void _kernel_preverify_parallel_columns(
     const std::uint8_t* keep_col, const std::uint8_t* keep_row,
     const double* c,
     const NnzOffset* row_ptr, const std::int32_t* row_idx, const double* row_val,
-    double zero_tol, double coeff_tol, double obj_tol, std::int32_t n) {
+    double zero_tol, double coeff_tol, std::int32_t n) {
   const std::int32_t b =
       static_cast<std::int32_t>(NnzOffset(blockIdx.x) * blockDim.x + threadIdx.x);
   if (b >= n) return;
@@ -355,8 +356,7 @@ __global__ void _kernel_preverify_parallel_columns(
         row_ptr[k], row_ptr[k + 1], row_idx, row_val, keep_row, zero_tol);
     if (first_j >= row_ptr[j + 1] || first_k >= row_ptr[k + 1]) continue;
     const double first_ratio = row_val[first_k] / row_val[first_j];
-    if (isfinite(first_ratio) &&
-        fabs(c[k] - first_ratio * c[j]) <= obj_tol) {
+    if (detail::objective_costs_proportional(c[j], c[k], first_ratio)) {
       partner = a;
       break;
     }
@@ -416,7 +416,6 @@ __global__ void _kernel_count_small_high_ratio_parallel_groups(
     const double* row_val,
     double zero_tol,
     double coeff_tol,
-    double obj_tol,
     double max_abs_ratio,
     std::int32_t max_group_size,
     std::int32_t stop_after,
@@ -453,7 +452,7 @@ __global__ void _kernel_count_small_high_ratio_parallel_groups(
                                zero_tol, coeff_tol, &ratio)) {
         continue;
       }
-      if (fabs(c[k] - ratio * c[j]) > obj_tol) {
+      if (!detail::objective_costs_proportional(c[j], c[k], ratio)) {
         continue;
       }
       const double abs_ratio = fabs(ratio);
@@ -491,7 +490,6 @@ __global__ void _kernel_parallel_column_groups(std::int32_t* status_flag,
                                             const double* row_val,
                                             double zero_tol,
                                             double coeff_tol,
-                                            double obj_tol,
                                             double max_abs_ratio,
                                             const std::int32_t* scale_guard_group_count,
                                             std::int32_t scale_guard_min_groups,
@@ -530,7 +528,7 @@ __global__ void _kernel_parallel_column_groups(std::int32_t* status_flag,
           const auto first_k = _next_live_parallel_column_entry(row_ptr[k], row_ptr[k+1], row_idx, row_val, keep_row, zero_tol);
           if (first_j < row_ptr[j+1] && first_k < row_ptr[k+1]) {
             const double first_ratio = row_val[first_k] / row_val[first_j];
-            if (fabs(c[k] - first_ratio * c[j]) > obj_tol) continue;
+            if (!detail::objective_costs_proportional(c[j], c[k], first_ratio)) continue;
           }
         }
         double ratio = 0.0;
@@ -555,13 +553,17 @@ __global__ void _kernel_parallel_column_groups(std::int32_t* status_flag,
           continue;
         }
 
-        const double obj_gap = c[k] - ratio * c[j];
+        const double scaled_obj = ratio * c[j];
+        if (!isfinite(c[k]) || !isfinite(scaled_obj) ||
+            (c[j] != 0.0 && fabs(scaled_obj) < DBL_MIN)) {
+          continue;
+        }
         const double target_l = l[j];
         const double target_u = u[j];
         const double source_l = l[k];
         const double source_u = u[k];
 
-        if (fabs(obj_gap) <= obj_tol) {
+        if (detail::objective_costs_proportional(c[j], c[k], ratio)) {
           merge_to[k] = j;
           merge_ratio[k] = ratio;
           merge_from_l[k] = source_l;
@@ -579,7 +581,7 @@ __global__ void _kernel_parallel_column_groups(std::int32_t* status_flag,
         bool fix_xk_to_upper = false;
         bool fix_xj_to_lower = false;
         bool fix_xj_to_upper = false;
-        if (obj_gap > obj_tol) {
+        if (c[k] > scaled_obj) {
           if (ratio > 0.0) {
             fix_xk_to_lower = !isfinite(target_u);
             fix_xj_to_upper = !isfinite(source_l);
@@ -1080,7 +1082,6 @@ void apply_rule_parallel_columns(PresolvePlanGpu& plan,
   profile_stage("device_sort", sort_start);
 
   const double coeff_tol = fmax(pparams.zero_tol, pparams.bound_tol);
-  const double obj_tol = fmax(pparams.zero_tol, pparams.bound_tol);
   const bool use_scale_guard_gate =
       isfinite(pparams.parallel_columns_max_abs_ratio) &&
       pparams.parallel_columns_scale_guard_min_groups > 1;
@@ -1098,7 +1099,6 @@ void apply_rule_parallel_columns(PresolvePlanGpu& plan,
         lp.AT.nzVal,
         pparams.zero_tol,
         coeff_tol,
-        obj_tol,
         pparams.parallel_columns_max_abs_ratio,
         pparams.parallel_columns_scale_guard_max_group_size,
         pparams.parallel_columns_scale_guard_min_groups,
@@ -1114,7 +1114,7 @@ void apply_rule_parallel_columns(PresolvePlanGpu& plan,
         sort_hash, sorted_cols, plan.keep_col_mask, plan.keep_row_mask,
         plan.new_c,
         lp.AT.rowPtr, lp.AT.colVal, lp.AT.nzVal,
-        pparams.zero_tol, coeff_tol, obj_tol, sort_count);
+        pparams.zero_tol, coeff_tol, sort_count);
     throw_if_cuda_error(cudaGetLastError(), "_kernel_preverify_parallel_columns");
   }
   profile_stage("parallel_verify", parallel_verify_start);
@@ -1145,7 +1145,6 @@ void apply_rule_parallel_columns(PresolvePlanGpu& plan,
       lp.AT.nzVal,
       pparams.zero_tol,
       coeff_tol,
-      obj_tol,
       pparams.parallel_columns_max_abs_ratio,
       use_scale_guard_gate ? scale_guard_group_count : nullptr,
       pparams.parallel_columns_scale_guard_min_groups,
